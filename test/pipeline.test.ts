@@ -144,6 +144,35 @@ describe("run pipeline", () => {
     });
   });
 
+  it("classifies only the first batch and writes diagnostic stats without a report", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-classify-only-"));
+    process.env.YOUTUBE_API_KEY = "test-key";
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const result = await runChannel({
+      channel,
+      config,
+      days: 30,
+      send: false,
+      classifyOnly: true,
+      debug: true,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: fetcher(),
+      wait: async () => {},
+    });
+    expect(result.classifyOnly).toBe(true);
+    expect(result.stats.classifyOnly).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('"itemsValid":1'));
+    await expect(
+      readFile(join(result.reportFolder, "stats.json"), "utf8"),
+    ).resolves.toContain('"classifyOnly": true');
+    await expect(
+      readFile(join(result.reportFolder, "report.md"), "utf8"),
+    ).rejects.toThrow();
+  });
+
   it("saves failed-batch stats and aborts instead of writing an empty report", async () => {
     root = await mkdtemp(join(tmpdir(), "yt-report-run-failed-"));
     process.env.YOUTUBE_API_KEY = "test-key";
@@ -176,7 +205,7 @@ describe("run pipeline", () => {
         fetcher: invalidJsonFetcher,
         wait: async () => {},
       }),
-    ).rejects.toThrow(/failed for 1 of 1 batches.*no report was produced/i);
+    ).rejects.toThrow(/No comments were classified.*no report was produced/i);
     const folder = join(outputRoot, "@creator", "2026-03-15");
     const stats = JSON.parse(
       await readFile(join(folder, "stats.json"), "utf8"),
@@ -190,6 +219,58 @@ describe("run pipeline", () => {
     expect(stats.commentsSentToLlm).toBe(1);
     expect(llmPrompts).toHaveLength(2);
     expect(llmPrompts[1]).toContain("STRICT FORMAT REMINDER");
+    await expect(readFile(join(folder, "report.md"), "utf8")).rejects.toThrow();
+  });
+
+  it("fails with saved stats when no comments are classified", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-run-empty-"));
+    process.env.YOUTUBE_API_KEY = "test-key";
+    process.env.LLM_API_KEY = "test-llm-key";
+    const youtubeFetcher = fetcher();
+    const emptyResultFetcher: Fetcher = async (input, init) => {
+      if (new URL(String(input)).hostname === "www.googleapis.com")
+        return youtubeFetcher(input, init);
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"classifications":[]}' } }],
+        }),
+        { status: 200 },
+      );
+    };
+    const outputRoot = join(root, "output");
+    await expect(
+      runChannel({
+        channel,
+        config: { ...config, provider: "openai", model: "test-model" },
+        days: 30,
+        send: false,
+        outputRoot,
+        cacheRoot: join(root, "cache"),
+        usagePath: join(root, "usage", "usage.jsonl"),
+        now: new Date("2026-03-15T00:00:00Z"),
+        fetcher: emptyResultFetcher,
+        wait: async () => {},
+      }),
+    ).rejects.toThrow(/No comments were classified.*no report was produced/i);
+    const folder = join(outputRoot, "@creator", "2026-03-15");
+    const stats = JSON.parse(
+      await readFile(join(folder, "stats.json"), "utf8"),
+    ) as {
+      failureReason: string;
+      classificationSucceeded: boolean;
+      commentsSentToLlm: number;
+      batches: { failed: { reason: string }[] };
+    };
+    expect(stats).toMatchObject({
+      classificationSucceeded: false,
+      commentsSentToLlm: 1,
+      failureReason:
+        "No comments were classified despite sending comments to the LLM.",
+      batches: { failed: [{ reason: "coverage_failure" }] },
+    });
+    await expect(
+      readFile(join(folder, "report.html"), "utf8"),
+    ).rejects.toThrow();
     await expect(readFile(join(folder, "report.md"), "utf8")).rejects.toThrow();
   });
 });

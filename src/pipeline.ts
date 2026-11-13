@@ -26,6 +26,7 @@ export interface RunOptions {
   wait?: (milliseconds: number) => Promise<void>;
   sendEmailFn?: typeof sendEmail;
   debug?: boolean;
+  classifyOnly?: boolean;
 }
 
 export interface RunStats {
@@ -34,6 +35,8 @@ export interface RunStats {
   commentsFetched: number;
   commentsSentToLlm: number;
   classificationSucceeded: boolean;
+  failureReason?: string;
+  classifyOnly?: boolean;
   stoppedReason?: string;
   batches: {
     total: number;
@@ -62,6 +65,7 @@ export interface RunResult {
   videosAnalyzed: number;
   commentsFetched: number;
   stats: RunStats;
+  classifyOnly: boolean;
 }
 
 function channelKey(channel: ChannelConfig): string {
@@ -105,7 +109,10 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     cacheRoot,
     now,
   );
-  const analysis = await analyzeComments(data.comments, {
+  const analysisComments = options.classifyOnly
+    ? data.comments.slice(0, 20)
+    : data.comments;
+  const analysis = await analyzeComments(analysisComments, {
     provider: options.config.provider,
     ...(options.config.model ? { model: options.config.model } : {}),
     ...(options.config.fallbackModel
@@ -113,24 +120,40 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
       : {}),
     maxUsdPerRun: options.config.limits.maxUsdPerRun,
     maxUsdPerDay: options.config.limits.maxUsdPerDay,
+    ...(options.config.limits.maxOutputTokensPerComment !== undefined
+      ? {
+          maxOutputTokensPerComment:
+            options.config.limits.maxOutputTokensPerComment,
+        }
+      : {}),
+    ...(options.config.limits.outputTokenOverhead !== undefined
+      ? { outputTokenOverhead: options.config.limits.outputTokenOverhead }
+      : {}),
     now,
     ...(process.env.LLM_API_KEY ? { apiKey: process.env.LLM_API_KEY } : {}),
     ...(options.usagePath ? { usagePath: options.usagePath } : {}),
     ...(options.fetcher ? { fetcher: options.fetcher } : {}),
     ...(options.wait ? { wait: options.wait } : {}),
     onProgress: (message) => console.log(message),
-    ...(options.debug
+    ...(options.debug || options.classifyOnly
       ? {
           onBatchEvent: (event) => {
-            const details = [
-              `batch ${event.batch}/${event.totalBatches}`,
-              `attempt ${event.attempt}`,
-              event.model ? `model=${event.model}` : "",
-              event.reason ? `reason="${event.reason}"` : "",
-            ]
-              .filter(Boolean)
-              .join(" ");
-            console.log(`LLM ${event.outcome}: ${details}`);
+            console.log(
+              `LLM batch: ${JSON.stringify({
+                batch: `${event.batch}/${event.totalBatches}`,
+                chunk: event.chunk ?? "1",
+                attempt: event.attempt,
+                commentsSent: event.commentsSent ?? 0,
+                itemsReturned: event.itemsReturned ?? 0,
+                itemsValid: event.itemsValid ?? 0,
+                finishReason: event.finishReason ?? null,
+                promptFeedbackBlockReason:
+                  event.promptFeedbackBlockReason ?? null,
+                usageMetadata: event.usageMetadata ?? null,
+                rawResponseTextLength: event.rawResponseTextLength ?? 0,
+                outcome: event.outcome,
+              })}`,
+            );
           },
         }
       : {}),
@@ -179,15 +202,30 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   };
   for (const classification of analysis.classifications)
     classificationsByCategory[classification.category] += 1;
+  const classifiedCount = Object.values(classificationsByCategory).reduce(
+    (total, count) => total + count,
+    0,
+  );
+  const zeroClassifications =
+    analysis.commentsSentToLlm > 0 && classifiedCount === 0;
+  const zeroClassificationReason =
+    "No comments were classified despite sending comments to the LLM.";
   const stats: RunStats = {
     date: now.toISOString().slice(0, 10),
     videosAnalyzed: data.videos.length,
     commentsFetched: data.comments.length,
     commentsSentToLlm: analysis.commentsSentToLlm,
-    classificationSucceeded: analysis.classificationSucceeded,
-    ...(analysis.stoppedReason
-      ? { stoppedReason: analysis.stoppedReason }
-      : {}),
+    classificationSucceeded:
+      analysis.classificationSucceeded && !zeroClassifications,
+    ...(zeroClassifications
+      ? {
+          stoppedReason: zeroClassificationReason,
+          failureReason: zeroClassificationReason,
+        }
+      : analysis.stoppedReason
+        ? { stoppedReason: analysis.stoppedReason }
+        : {}),
+    ...(options.classifyOnly ? { classifyOnly: true } : {}),
     batches: {
       total: analysis.batchCount,
       successful: analysis.successfulBatches,
@@ -211,6 +249,11 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   };
   await appendUsage(usage, options.usagePath);
   printRunSummary(stats);
+  if (zeroClassifications) {
+    throw new Error(
+      `${zeroClassificationReason} Stats were saved to ${resolve(folder, "stats.json")}; no report was produced.`,
+    );
+  }
   const totalFailures = analysis.failedBatches.length;
   const exceedsFailureThreshold =
     analysis.batchCount > 0 && totalFailures / analysis.batchCount > 0.3;
@@ -218,6 +261,17 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     throw new Error(
       `Analysis failed for ${totalFailures} of ${analysis.batchCount} batches (>30%). Stats were saved to ${resolve(folder, "stats.json")}; no report was produced.`,
     );
+  }
+  if (options.classifyOnly) {
+    console.log("Classification-only mode: no report was written.");
+    return {
+      reportFolder: folder,
+      sent: false,
+      videosAnalyzed: data.videos.length,
+      commentsFetched: data.comments.length,
+      stats,
+      classifyOnly: true,
+    };
   }
   console.log("Writing report.");
   await Promise.all([
@@ -253,6 +307,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     videosAnalyzed: data.videos.length,
     commentsFetched: data.comments.length,
     stats,
+    classifyOnly: false,
   };
 }
 

@@ -33,6 +33,8 @@ export interface AppConfig {
     maxThreadsPerVideo: number;
     maxUsdPerRun: number;
     maxUsdPerDay: number;
+    maxOutputTokensPerComment?: number;
+    outputTokenOverhead?: number;
   };
   channels: ChannelConfig[];
 }

@@ -25,6 +25,10 @@ program
   .option("--dry-run", "Write report only (default; no email is sent)")
   .option("--send", "Send the report to configured recipients")
   .option("--debug", "Log sanitized LLM batch outcomes")
+  .option(
+    "--classify-only",
+    "Classify the first batch only; do not write a report",
+  )
   .action(
     async (options: {
       channel: string;
@@ -32,9 +36,12 @@ program
       dryRun?: boolean;
       send?: boolean;
       debug?: boolean;
+      classifyOnly?: boolean;
     }) => {
       if (options.send && options.dryRun)
         throw new Error("Choose either --send or --dry-run, not both.");
+      if (options.send && options.classifyOnly)
+        throw new Error("--classify-only cannot be combined with --send.");
       const config = await loadConfig();
       const channel = matchChannel(config.channels, options.channel);
       const result = await runChannel({
@@ -42,8 +49,15 @@ program
         config,
         days: Number(options.days),
         send: options.send === true,
-        debug: options.debug === true,
+        debug: options.debug === true || options.classifyOnly === true,
+        classifyOnly: options.classifyOnly === true,
       });
+      if (result.classifyOnly) {
+        console.log(
+          `Classification-only stats saved to ${result.reportFolder}/stats.json.`,
+        );
+        return;
+      }
       console.log(
         `Report saved to ${result.reportFolder} (${result.videosAnalyzed} videos, ${result.commentsFetched} comments).`,
       );

@@ -34,6 +34,8 @@ const configSchema = z
         maxThreadsPerVideo: z.number().int().min(1).max(300).default(300),
         maxUsdPerRun: z.number().nonnegative().default(0.5),
         maxUsdPerDay: z.number().nonnegative().default(2),
+        maxOutputTokensPerComment: z.number().int().min(1).default(60),
+        outputTokenOverhead: z.number().int().min(0).default(256),
       })
       .default({}),
     channels: z.array(channelSchema).min(1),

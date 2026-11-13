@@ -7,7 +7,9 @@
     "maxVideos": 8,
     "maxThreadsPerVideo": 300,
     "maxUsdPerRun": 0.5,
-    "maxUsdPerDay": 2
+    "maxUsdPerDay": 2,
+    "maxOutputTokensPerComment": 60,
+    "outputTokenOverhead": 256
   },
   "channels": [
     {

@@ -135,6 +135,220 @@ describe("comment analysis safety", () => {
     expect(result.successfulBatches).toBe(1);
   });
 
+  it("fails and retries when a non-empty batch returns no classifications", async () => {
+    const events: { outcome: string; itemsReturned?: number }[] = [];
+    let calls = 0;
+    const result = await analyzeComments([comment], {
+      provider: "openai",
+      model: "test-model",
+      apiKey: "test-key",
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async () => {
+        calls += 1;
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '{"classifications":[]}' } }],
+          }),
+          { status: 200 },
+        );
+      },
+      onBatchEvent: (event) => events.push(event),
+    });
+    expect(calls).toBe(2);
+    expect(result.classifications).toEqual([]);
+    expect(result.successfulBatches).toBe(0);
+    expect(result.failedBatches).toEqual([
+      { batch: 1, reason: "coverage_failure" },
+    ]);
+    expect(events.map((event) => event.outcome)).toEqual([
+      "coverage_failure",
+      "coverage_failure",
+    ]);
+    expect(events.map((event) => event.itemsReturned)).toEqual([0, 0]);
+  });
+
+  it("retries missing IDs with the expected IDs in the stricter prompt", async () => {
+    const prompts: string[] = [];
+    const result = await analyzeComments([comment], {
+      provider: "openai",
+      model: "test-model",
+      apiKey: "test-key",
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          messages: { content: string }[];
+        };
+        prompts.push(request.messages[0]?.content ?? "");
+        const commentId = prompts.length === 1 ? "unknown" : "c1";
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    classifications: [
+                      {
+                        commentId,
+                        category: "how_to_question",
+                        quote: "How do I use this?",
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      },
+    });
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('Expected IDs: ["c1"]');
+    expect(result.failedBatches).toEqual([]);
+    expect(result.classifications).toHaveLength(1);
+    expect(result.successfulBatches).toBe(1);
+  });
+
+  it("retries MAX_TOKENS responses with smaller comment chunks", async () => {
+    const prompts: string[] = [];
+    const events: { outcome: string; chunk?: string }[] = [];
+    const result = await analyzeComments(
+      [
+        comment,
+        { ...comment, commentId: "c2", text: "How can I configure this?" },
+      ],
+      {
+        provider: "gemini",
+        model: "test-model",
+        apiKey: "test-key",
+        batchSize: 2,
+        maxUsdPerRun: 1,
+        maxUsdPerDay: 1,
+        dailyUsage: [],
+        fetcher: async (_input, init) => {
+          const request = JSON.parse(String(init?.body)) as {
+            contents: { parts: { text: string }[] }[];
+            generationConfig: {
+              responseMimeType: string;
+              responseSchema: unknown;
+              thinkingConfig: { thinkingBudget: number };
+            };
+          };
+          const prompt = request.contents[0]?.parts[0]?.text ?? "";
+          prompts.push(prompt);
+          if (prompts.length === 1) {
+            expect(request.generationConfig).toMatchObject({
+              responseMimeType: "application/json",
+              thinkingConfig: { thinkingBudget: 0 },
+            });
+            expect(request.generationConfig.responseSchema).toBeDefined();
+            return new Response(
+              JSON.stringify({
+                candidates: [
+                  { finishReason: "MAX_TOKENS", content: { parts: [] } },
+                ],
+                usageMetadata: {
+                  promptTokenCount: 100,
+                  candidatesTokenCount: 0,
+                  thoughtsTokenCount: 12,
+                  totalTokenCount: 112,
+                },
+              }),
+              { status: 200 },
+            );
+          }
+          const commentId = prompt.includes('"commentId":"c1"') ? "c1" : "c2";
+          return new Response(
+            JSON.stringify({
+              candidates: [
+                {
+                  finishReason: "STOP",
+                  content: {
+                    parts: [
+                      {
+                        text: JSON.stringify({
+                          classifications: [
+                            {
+                              commentId,
+                              category: "how_to_question",
+                              quote:
+                                commentId === "c1"
+                                  ? "How do I use this?"
+                                  : "How can I configure this?",
+                            },
+                          ],
+                        }),
+                      },
+                    ],
+                  },
+                },
+              ],
+              usageMetadata: {
+                promptTokenCount: 50,
+                candidatesTokenCount: 30,
+                thoughtsTokenCount: 0,
+                totalTokenCount: 80,
+              },
+            }),
+            { status: 200 },
+          );
+        },
+        onBatchEvent: (event) => events.push(event),
+      },
+    );
+    expect(prompts).toHaveLength(3);
+    expect(prompts[1]).toContain('"commentId":"c1"');
+    expect(prompts[1]).not.toContain('"commentId":"c2"');
+    expect(prompts[2]).toContain('"commentId":"c2"');
+    expect(result.classifications).toHaveLength(2);
+    expect(result.failedBatches).toEqual([]);
+    expect(events[0]).toMatchObject({
+      outcome: "truncated",
+      usageMetadata: { thoughtsTokenCount: 12 },
+      rawResponseTextLength: 0,
+    });
+  });
+
+  it("accepts a complete classification for every comment ID", async () => {
+    const result = await analyzeComments([comment], {
+      provider: "openai",
+      model: "test-model",
+      apiKey: "test-key",
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async () =>
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    classifications: [
+                      {
+                        commentId: "c1",
+                        category: "how_to_question",
+                        quote: "How do I use this?",
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+    });
+    expect(result.classifications).toHaveLength(1);
+    expect(result.failedBatches).toEqual([]);
+    expect(result.successfulBatches).toBe(1);
+    expect(result.classificationSucceeded).toBe(true);
+  });
+
   it("counts emoji-only comments as noise without rendering them as findings", async () => {
     const emojiComment = { ...comment, text: "🔥 🙌" };
     const analysis = await analyzeComments([emojiComment], {
