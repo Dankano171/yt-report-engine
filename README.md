@@ -64,12 +64,14 @@ The program batches comments and checks the estimate against the configured spen
 
 ## How to read the report
 
+- **Quick pulse:** direct counts and shares for analyzed comments, questions, praise, requests, objections, noise, and creator replies. It contains no scores or ratings.
 - **Money on the table:** unanswered purchase/sponsor inquiries and high-like questions, with each quote, its public comment link, and a clearly marked editable draft reply.
-- **Next video ideas:** 2–3 proposals based on repeated questions and topic requests, grounded in viewer wording and linked examples.
-- **Fix list:** confusion, apparent broken/missing links, and recurring complaints, with a video and any available timestamp.
+- **Requests and ideas:** topic, language/subtitle, alternative-tool, and format requests, plus questions that could inspire ideas. Single mentions are included, with one or two source quotes and links per similar request.
+- **Fix list:** confusion, broken/missing links, objections, and stated limitations. Similar comments are grouped and labeled by viewer count, including single mentions.
 - **Proof pack:** selected viewer testimonials/results. Ordering is tailored to the creator goal.
+- **Already answered: pin these:** repeated or high-like questions that have a creator reply, with the fetched reply link when available and a suggestion to pin it or add it to the video description FAQ.
 
-“How to read this” notes that the analysis is AI-generated. Counts and links come from fetched data; quotes are kept only when they match the fetched source comment after Unicode, whitespace, and HTML-entity normalization.
+Emoji-only and low-information comments such as “Full course” and “thanks” are classified as noise and counted, but never shown as findings. “How to read this” notes that the analysis is AI-generated. Counts and links come from fetched data; quotes are kept only when they match the fetched source comment after Unicode, whitespace, and HTML-entity normalization.
 
 ## Troubleshooting
 

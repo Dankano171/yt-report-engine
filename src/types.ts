@@ -8,6 +8,9 @@ export type Category =
   | "complaint_or_objection"
   | "testimonial_or_result"
   | "topic_request"
+  | "language_or_subtitles_request"
+  | "alternative_or_tool_request"
+  | "format_request"
   | "praise"
   | "spam_or_noise";
 
@@ -53,6 +56,7 @@ export interface CommentRecord {
   totalReplyCount: number;
   authorChannelId?: string;
   creatorReplied: boolean;
+  creatorReplyId?: string;
 }
 
 export interface Classification {

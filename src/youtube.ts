@@ -112,6 +112,7 @@ function commentFrom(
   videoId: string,
   totalReplyCount: number,
   creatorReplied: boolean,
+  creatorReplyId?: string,
 ): CommentRecord {
   const snippet = object(object(raw).snippet);
   const author = object(snippet.authorChannelId);
@@ -124,6 +125,7 @@ function commentFrom(
     totalReplyCount,
     ...(string(author.value) ? { authorChannelId: string(author.value) } : {}),
     creatorReplied,
+    ...(creatorReplyId ? { creatorReplyId } : {}),
   };
 }
 
@@ -266,12 +268,16 @@ export async function fetchChannelData(
         const threadSnippet = object(thread.snippet);
         const totalReplies = number(threadSnippet.totalReplyCount);
         const replies = array(object(thread.replies).comments);
-        let creatorReplied = replies.some((reply) => {
-          const authorId = string(
-            object(object(object(reply).snippet).authorChannelId).value,
-          );
-          return authorId === channelId;
-        });
+        const creatorReply = replies.find(
+          (reply) =>
+            string(
+              object(object(object(reply).snippet).authorChannelId).value,
+            ) === channelId,
+        );
+        let creatorReplied = Boolean(creatorReply);
+        let creatorReplyId = creatorReply
+          ? string(object(creatorReply).id) || undefined
+          : undefined;
         if (totalReplies > replies.length) {
           let replyToken: string | undefined;
           let repliesLoaded = 0;
@@ -293,12 +299,17 @@ export async function fetchChannelData(
             );
             quotaUnits += 1;
             const loaded = array(replyPage.items);
-            creatorReplied ||= loaded.some(
+            const loadedCreatorReply = loaded.find(
               (reply) =>
                 string(
                   object(object(object(reply).snippet).authorChannelId).value,
                 ) === channelId,
             );
+            creatorReplied ||= Boolean(loadedCreatorReply);
+            creatorReplyId ||=
+              (loadedCreatorReply
+                ? string(object(loadedCreatorReply).id)
+                : "") || undefined;
             repliesLoaded += loaded.length;
             replyToken = replyPage.nextPageToken;
           } while (replyToken && repliesLoaded < totalReplies);
@@ -309,6 +320,7 @@ export async function fetchChannelData(
             video.videoId,
             totalReplies,
             creatorReplied,
+            creatorReplyId,
           ),
         );
       }
@@ -320,8 +332,13 @@ export async function fetchChannelData(
   return { channelId, videos, comments, quotaUnits };
 }
 
-export function buildDeepLink(videoId: string, commentId: string): string {
-  return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&lc=${encodeURIComponent(commentId)}`;
+export function buildDeepLink(
+  videoId: string,
+  commentId: string,
+  replyId?: string,
+): string {
+  const linkedCommentId = replyId ? `${commentId}.${replyId}` : commentId;
+  return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&lc=${encodeURIComponent(linkedCommentId)}`;
 }
 
 export function parseDurationSeconds(value: string): number {

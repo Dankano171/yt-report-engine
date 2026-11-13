@@ -64,7 +64,10 @@ function fakeYouTubeFetch(): Fetcher {
             },
             replies: {
               comments: [
-                { snippet: { authorChannelId: { value: "UCcreator" } } },
+                {
+                  id: "reply-1",
+                  snippet: { authorChannelId: { value: "UCcreator" } },
+                },
               ],
             },
           },
@@ -90,12 +93,19 @@ describe("YouTube data", () => {
     expect(result.videos.map((video) => video.videoId)).toEqual(["video2"]);
     expect(result.comments).toHaveLength(1);
     expect(result.comments[0]?.creatorReplied).toBe(true);
+    expect(result.comments[0]?.creatorReplyId).toBe("reply-1");
     expect(result.comments[0]?.totalReplyCount).toBe(1);
   });
 
   it("builds the canonical comment deep link", () => {
     expect(buildDeepLink("video 1", "comment/2")).toBe(
       "https://www.youtube.com/watch?v=video%201&lc=comment%2F2",
+    );
+  });
+
+  it("builds the canonical creator-reply deep link", () => {
+    expect(buildDeepLink("video1", "comment1", "reply1")).toBe(
+      "https://www.youtube.com/watch?v=video1&lc=comment1.reply1",
     );
   });
 });

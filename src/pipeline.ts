@@ -46,6 +46,7 @@ export interface RunStats {
     ideas: number;
     fixes: number;
     proofs: number;
+    answered: number;
   };
   droppedQuotes: {
     emptyQuote: number;
@@ -170,6 +171,9 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     complaint_or_objection: 0,
     testimonial_or_result: 0,
     topic_request: 0,
+    language_or_subtitles_request: 0,
+    alternative_or_tool_request: 0,
+    format_request: 0,
     praise: 0,
     spam_or_noise: 0,
   };

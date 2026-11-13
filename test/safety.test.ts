@@ -134,6 +134,29 @@ describe("comment analysis safety", () => {
     expect(result.classifications).toHaveLength(1);
     expect(result.successfulBatches).toBe(1);
   });
+
+  it("counts emoji-only comments as noise without rendering them as findings", async () => {
+    const emojiComment = { ...comment, text: "🔥 🙌" };
+    const analysis = await analyzeComments([emojiComment], {
+      provider: "mock",
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+    });
+    expect(analysis.classifications).toMatchObject([
+      { commentId: "c1", category: "spam_or_noise" },
+    ]);
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [emojiComment],
+      classifications: analysis.classifications,
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain("Noise: 1 (100%)");
+    expect(report.markdown).not.toContain("🔥");
+    expect(report.html).not.toContain("🔥");
+  });
 });
 
 describe("report generation", () => {
@@ -197,6 +220,101 @@ describe("report generation", () => {
     );
     expect(report.markdown).toContain(
       "Not reported because classification did not complete successfully",
+    );
+  });
+
+  it("shows a creator-answered repeated question and reply deep link in section E", () => {
+    const answeredQuestion = {
+      commentId: "answered1",
+      category: "how_to_question" as const,
+      quote: "How do I set this up?",
+    };
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [
+        {
+          ...comment,
+          commentId: "answered1",
+          text: "How do I set this up?",
+          authorChannelId: "viewer1",
+          creatorReplied: true,
+          creatorReplyId: "reply1",
+        },
+        {
+          ...comment,
+          commentId: "answered2",
+          text: "How can I set this up?",
+          authorChannelId: "viewer2",
+          creatorReplied: true,
+          creatorReplyId: "reply2",
+        },
+      ],
+      classifications: [
+        answeredQuestion,
+        {
+          ...answeredQuestion,
+          commentId: "answered2",
+          quote: "How can I set this up?",
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain("## E. Already answered: pin these");
+    expect(report.markdown).toContain("2 viewers");
+    expect(report.markdown).toContain(
+      "https://www.youtube.com/watch?v=v1&lc=answered1.reply1",
+    );
+    expect(report.markdown).toContain(
+      "Pin an answer comment or add it to the video description FAQ.",
+    );
+    expect(report.html).toContain("Already answered: pin these");
+    expect(report.html).toContain(
+      'href="https://www.youtube.com/watch?v=v1&amp;lc=answered1.reply1"',
+    );
+  });
+
+  it("includes a single-mention objection in the fix list", () => {
+    const objection = "This strategy only works in bull markets.";
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [{ ...comment, text: objection, authorChannelId: "viewer1" }],
+      classifications: [
+        {
+          commentId: "c1",
+          category: "complaint_or_objection",
+          quote: objection,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain("## C. Fix list");
+    expect(report.markdown).toContain(
+      "**Objection or limitation** — 1 viewer (single mention)",
+    );
+    expect(report.markdown).toContain(objection);
+  });
+
+  it("shows a single-mention language request with its fetched comment link", () => {
+    const request = "Could you add Spanish subtitles?";
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [{ ...comment, text: request }],
+      classifications: [
+        {
+          commentId: "c1",
+          category: "language_or_subtitles_request",
+          quote: request,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain("## B. Requests and ideas");
+    expect(report.markdown).toContain("1 viewer (single mention)");
+    expect(report.markdown).toContain(
+      "[Open comment](https://www.youtube.com/watch?v=v1&lc=c1)",
     );
   });
 
