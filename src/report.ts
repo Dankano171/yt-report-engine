@@ -13,6 +13,7 @@ interface ReportInput {
   comments: CommentRecord[];
   classifications: Classification[];
   dateRange: { from: string; to: string };
+  classificationSucceeded?: boolean;
   stoppedReason?: string;
 }
 
@@ -27,6 +28,18 @@ export interface RenderedReport {
   markdown: string;
   html: string;
   verifiedClassifications: Classification[];
+  sectionItemCounts: {
+    money: number;
+    ideas: number;
+    fixes: number;
+    proofs: number;
+  };
+  droppedQuotes: {
+    emptyQuote: number;
+    quoteNotFound: number;
+    unknownComment: number;
+    missingVideo: number;
+  };
 }
 
 function escapeHtml(value: string): string {
@@ -181,21 +194,85 @@ function isRecurringComplaint(finding: Finding, findings: Finding[]): boolean {
   );
 }
 
-function findingList(input: ReportInput): Finding[] {
+function normalizeForQuoteMatch(text: string): string {
+  const namedEntities: Record<string, string> = {
+    amp: "&",
+    apos: "'",
+    bull: "•",
+    copy: "©",
+    eacute: "é",
+    Eacute: "É",
+    egrave: "è",
+    Egrave: "È",
+    gt: ">",
+    hellip: "…",
+    ldquo: "“",
+    lsquo: "‘",
+    lt: "<",
+    mdash: "—",
+    ndash: "–",
+    nbsp: " ",
+    quot: '"',
+    rdquo: "”",
+    reg: "®",
+    rsquo: "’",
+    trade: "™",
+  };
+  return text
+    .replace(/&(#(?:x[\da-f]+|\d+)|[a-z]+);/gi, (entity, value: string) => {
+      if (value.startsWith("#")) {
+        const hex = value[1]?.toLowerCase() === "x";
+        const codePoint = Number.parseInt(
+          value.slice(hex ? 2 : 1),
+          hex ? 16 : 10,
+        );
+        return Number.isFinite(codePoint) && codePoint <= 0x10ffff
+          ? String.fromCodePoint(codePoint)
+          : entity;
+      }
+      return (
+        namedEntities[value] ?? namedEntities[value.toLowerCase()] ?? entity
+      );
+    })
+    .normalize("NFKC")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function findingList(input: ReportInput): {
+  findings: Finding[];
+  droppedQuotes: RenderedReport["droppedQuotes"];
+} {
   const comments = new Map(
     input.comments.map((comment) => [comment.commentId, comment]),
   );
   const videos = new Map(input.videos.map((video) => [video.videoId, video]));
   const findings: Finding[] = [];
+  const droppedQuotes = {
+    emptyQuote: 0,
+    quoteNotFound: 0,
+    unknownComment: 0,
+    missingVideo: 0,
+  };
   for (const classification of input.classifications) {
     const comment = comments.get(classification.commentId);
     if (!comment) {
+      droppedQuotes.unknownComment += 1;
       console.warn(
         `Dropping classification for unknown comment ${classification.commentId}.`,
       );
       continue;
     }
-    if (!classification.quote || !comment.text.includes(classification.quote)) {
+    const quote = normalizeForQuoteMatch(classification.quote);
+    if (!quote) {
+      droppedQuotes.emptyQuote += 1;
+      console.warn(
+        `Dropping empty quote for comment ${classification.commentId}.`,
+      );
+      continue;
+    }
+    if (!normalizeForQuoteMatch(comment.text).includes(quote)) {
+      droppedQuotes.quoteNotFound += 1;
       console.warn(
         `Dropping non-verbatim quote for comment ${classification.commentId}.`,
       );
@@ -203,6 +280,7 @@ function findingList(input: ReportInput): Finding[] {
     }
     const video = videos.get(comment.videoId);
     if (!video) {
+      droppedQuotes.missingVideo += 1;
       console.warn(
         `Dropping comment ${classification.commentId} because its video is unavailable.`,
       );
@@ -215,7 +293,7 @@ function findingList(input: ReportInput): Finding[] {
       link: buildDeepLink(comment.videoId, comment.commentId),
     });
   }
-  return findings;
+  return { findings, droppedQuotes };
 }
 
 function orderProof(findings: Finding[], input: ReportInput): Finding[] {
@@ -249,7 +327,13 @@ function markdownFinding(finding: Finding): string {
   return `- **${escapeMarkdown(finding.video.title)}** — ${finding.comment.likeCount} likes — [Open comment](${finding.link})\n\n${quoteBlock(finding.classification.quote)}`;
 }
 
-function renderMarkdown(input: ReportInput, findings: Finding[]): string {
+function renderMarkdown(
+  input: ReportInput,
+  findings: Finding[],
+): {
+  markdown: string;
+  sectionItemCounts: RenderedReport["sectionItemCounts"];
+} {
   const videoNames = input.videos.length
     ? input.videos.map((video) => `“${escapeMarkdown(video.title)}”`).join(", ")
     : "none";
@@ -303,6 +387,14 @@ function renderMarkdown(input: ReportInput, findings: Finding[]): string {
     ),
     input,
   ).slice(0, 5);
+  const sectionItemCounts = {
+    money: money.length,
+    ideas: ideas.length,
+    fixes: fixes.length,
+    proofs: proofs.length,
+  };
+  const incompleteMessage =
+    "_Not reported because classification did not complete successfully._";
   const enough = input.videos.length > 0 || input.comments.length > 0;
   const sections = [
     `# ${escapeMarkdown(input.channel.creatorName)} — Audience intelligence`,
@@ -318,7 +410,9 @@ function renderMarkdown(input: ReportInput, findings: Finding[]): string {
               `${markdownFinding(finding)}\n\n  **DRAFT reply (edit before use):** ${escapeMarkdown(safeGeneratedText(finding.classification.draftReply ?? "Thanks for asking! I’ll share more details with you soon."))}`,
           )
           .join("\n\n")
-      : "_No unanswered purchase/sponsor inquiry or high-like question found in the analyzed comments._",
+      : input.classificationSucceeded === false
+        ? incompleteMessage
+        : "_No unanswered purchase/sponsor inquiry or high-like question found in the analyzed comments._",
     "",
     "## B. Next video ideas",
     ideas.length
@@ -328,7 +422,9 @@ function renderMarkdown(input: ReportInput, findings: Finding[]): string {
               `${index + 1}. **${escapeMarkdown(safeGeneratedText(finding.classification.idea ?? "A video based on this viewer question"))}** — based on [this comment](${finding.link}) on “${escapeMarkdown(finding.video.title)}”:\n\n${quoteBlock(finding.classification.quote)}`,
           )
           .join("\n")
-      : "_Not enough recurring questions or topic requests to suggest a video._",
+      : input.classificationSucceeded === false
+        ? incompleteMessage
+        : "_Not enough recurring questions or topic requests to suggest a video._",
     "",
     "## C. Fix list",
     fixes.length
@@ -344,12 +440,16 @@ function renderMarkdown(input: ReportInput, findings: Finding[]): string {
             return `- **${escapeMarkdown(finding.video.title)}${timestamp ? ` at ${timestamp}` : ""}** — [Open comment](${finding.link})\n\n${quoteBlock(finding.classification.quote)}`;
           })
           .join("\n")
-      : "_No clear confusion, link issue, or recurring complaint identified._",
+      : input.classificationSucceeded === false
+        ? incompleteMessage
+        : "_No clear confusion, link issue, or recurring complaint identified._",
     "",
     "## D. Proof pack",
     proofs.length
       ? proofs.map(markdownFinding).join("\n\n")
-      : "_No testimonial or result comment identified._",
+      : input.classificationSucceeded === false
+        ? incompleteMessage
+        : "_No testimonial or result comment identified._",
     "",
     !enough
       ? "_Not enough data: no recent public videos or public comments were available to analyze._"
@@ -360,7 +460,10 @@ function renderMarkdown(input: ReportInput, findings: Finding[]): string {
     `---\nDate range: ${input.dateRange.from} to ${input.dateRange.to} · Videos analyzed (${input.videos.length}): ${videoNames}\n\nYou received this because you opted in. To unsubscribe, reply to the email asking to be removed.`,
     "",
   ];
-  return sections.filter((section) => section !== "").join("\n");
+  return {
+    markdown: sections.filter((section) => section !== "").join("\n"),
+    sectionItemCounts,
+  };
 }
 
 function markdownToHtml(markdown: string): string {
@@ -451,11 +554,15 @@ a{color:#2455be}li{margin:.65rem 0}footer{margin-top:2rem;color:#59616b;font-siz
 }
 
 export function renderReport(input: ReportInput): RenderedReport {
-  const verified = findingList(input);
-  const markdown = renderMarkdown(input, verified);
+  const verification = findingList(input);
+  const rendered = renderMarkdown(input, verification.findings);
   return {
-    markdown,
-    html: markdownToHtml(markdown),
-    verifiedClassifications: verified.map((finding) => finding.classification),
+    markdown: rendered.markdown,
+    html: markdownToHtml(rendered.markdown),
+    verifiedClassifications: verification.findings.map(
+      (finding) => finding.classification,
+    ),
+    sectionItemCounts: rendered.sectionItemCounts,
+    droppedQuotes: verification.droppedQuotes,
   };
 }

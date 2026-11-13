@@ -17,6 +17,7 @@ interface YouTubeOptions {
   now?: Date;
   fetcher?: Fetcher;
   wait?: (milliseconds: number) => Promise<void>;
+  onProgress?: (message: string) => void;
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -226,8 +227,12 @@ export async function fetchChannelData(
     }
   }
 
+  options.onProgress?.(`${videos.length} videos found.`);
   const comments: CommentRecord[] = [];
-  for (const video of videos) {
+  for (const [videoIndex, video] of videos.entries()) {
+    options.onProgress?.(
+      `Fetching comments for video ${videoIndex + 1} of ${videos.length}.`,
+    );
     let threadsRead = 0;
     let token: string | undefined;
     while (threadsRead < options.maxThreadsPerVideo) {

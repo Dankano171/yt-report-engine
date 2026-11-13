@@ -24,12 +24,14 @@ program
   .option("--days <days>", "Lookback period in days", "30")
   .option("--dry-run", "Write report only (default; no email is sent)")
   .option("--send", "Send the report to configured recipients")
+  .option("--debug", "Log sanitized LLM batch outcomes")
   .action(
     async (options: {
       channel: string;
       days: string;
       dryRun?: boolean;
       send?: boolean;
+      debug?: boolean;
     }) => {
       if (options.send && options.dryRun)
         throw new Error("Choose either --send or --dry-run, not both.");
@@ -40,6 +42,7 @@ program
         config,
         days: Number(options.days),
         send: options.send === true,
+        debug: options.debug === true,
       });
       console.log(
         `Report saved to ${result.reportFolder} (${result.videosAnalyzed} videos, ${result.commentsFetched} comments).`,

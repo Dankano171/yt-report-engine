@@ -22,6 +22,8 @@ export interface ChannelConfig {
 
 export interface AppConfig {
   provider: ProviderName;
+  model?: string;
+  fallbackModel?: string;
   emailFrom?: string;
   limits: {
     maxVideos: number;

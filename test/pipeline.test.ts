@@ -119,5 +119,77 @@ describe("run pipeline", () => {
     await expect(
       readFile(join(result.reportFolder, "report.html"), "utf8"),
     ).resolves.toContain("Audience intelligence");
+    const stats = JSON.parse(
+      await readFile(join(result.reportFolder, "stats.json"), "utf8"),
+    ) as {
+      videosAnalyzed: number;
+      commentsFetched: number;
+      commentsSentToLlm: number;
+      classificationsByCategory: Record<string, number>;
+      reportItemsBySection: Record<string, number>;
+      droppedQuotes: Record<string, number>;
+    };
+    expect(stats).toMatchObject({
+      videosAnalyzed: 1,
+      commentsFetched: 1,
+      commentsSentToLlm: 0,
+      classificationsByCategory: { how_to_question: 1 },
+      reportItemsBySection: { money: 1 },
+      droppedQuotes: {
+        emptyQuote: 0,
+        quoteNotFound: 0,
+        unknownComment: 0,
+        missingVideo: 0,
+      },
+    });
+  });
+
+  it("saves failed-batch stats and aborts instead of writing an empty report", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-run-failed-"));
+    process.env.YOUTUBE_API_KEY = "test-key";
+    process.env.LLM_API_KEY = "test-llm-key";
+    const youtubeFetcher = fetcher();
+    const llmPrompts: string[] = [];
+    const invalidJsonFetcher: Fetcher = async (input, init) => {
+      if (new URL(String(input)).hostname === "www.googleapis.com")
+        return youtubeFetcher(input, init);
+      const request = JSON.parse(String(init?.body)) as {
+        messages: { content: string }[];
+      };
+      llmPrompts.push(request.messages[0]?.content ?? "");
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "not json" } }] }),
+        { status: 200 },
+      );
+    };
+    const outputRoot = join(root, "output");
+    await expect(
+      runChannel({
+        channel,
+        config: { ...config, provider: "openai", model: "test-model" },
+        days: 30,
+        send: false,
+        outputRoot,
+        cacheRoot: join(root, "cache"),
+        usagePath: join(root, "usage", "usage.jsonl"),
+        now: new Date("2026-03-15T00:00:00Z"),
+        fetcher: invalidJsonFetcher,
+        wait: async () => {},
+      }),
+    ).rejects.toThrow(/failed for 1 of 1 batches.*no report was produced/i);
+    const folder = join(outputRoot, "@creator", "2026-03-15");
+    const stats = JSON.parse(
+      await readFile(join(folder, "stats.json"), "utf8"),
+    ) as {
+      batches: { failed: { reason: string }[] };
+      commentsSentToLlm: number;
+    };
+    expect(stats.batches.failed).toEqual([
+      { batch: 1, reason: "json_parse_failure" },
+    ]);
+    expect(stats.commentsSentToLlm).toBe(1);
+    expect(llmPrompts).toHaveLength(2);
+    expect(llmPrompts[1]).toContain("STRICT FORMAT REMINDER");
+    await expect(readFile(join(folder, "report.md"), "utf8")).rejects.toThrow();
   });
 });

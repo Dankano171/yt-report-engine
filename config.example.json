@@ -1,5 +1,7 @@
 {
   "provider": "gemini",
+  "model": "gemini-flash-lite-latest",
+  "fallbackModel": "gemini-2.5-flash",
   "emailFrom": "Creator Reports <reports@your-verified-domain.example>",
   "limits": {
     "maxVideos": 8,

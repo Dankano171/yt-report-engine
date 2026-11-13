@@ -5,7 +5,7 @@ A read-only YouTube audience intelligence CLI. It reads public comments on recen
 ## Setup (phone-friendly)
 
 1. Install Node.js 22.9 or newer and pnpm on the computer that will run this tool. Copy this repository to that computer and open a terminal in its folder.
-2. Copy `config.example.json` to `config.json` and change the creator name, channel handle (or channel ID), recipient email, goal, optional product keywords, and `emailFrom`. The sender address must be verified for your Resend account. Keep `config.json` private; it is git-ignored.
+2. Copy `config.example.json` to `config.json` and change the creator name, channel handle (or channel ID), recipient email, goal, optional product keywords, model, optional fallback model, and `emailFrom`. The sender address must be verified for your Resend account. Keep `config.json` private; it is git-ignored.
 3. In Google Cloud, enable YouTube Data API v3 and create an API key. Create an API key with your chosen LLM provider (Gemini, Anthropic, or OpenAI) and a Resend API key if you plan to send email. Restrict keys to the relevant APIs/services wherever supported. Do not paste keys into config or chat.
 4. Install and build:
 
@@ -30,7 +30,7 @@ A read-only YouTube audience intelligence CLI. It reads public comments on recen
 pnpm start -- run --channel @examplecreator --days 30
 ```
 
-The default is always a dry run: it writes `output/<channel>/<date>/report.html` and `report.md` and does not send email. Open the HTML on a phone or read the Markdown. The report includes linked, verbatim viewer quotes; inspect the draft replies and AI findings before using them.
+The default is always a dry run: it writes `output/<channel>/<date>/report.html`, `report.md`, and `stats.json` and does not send email. The run prints progress and a summary of fetched/analyzed data, classifications, report items, and quote verification. Use `--debug` to log batch outcomes without printing comment text. Open the HTML on a phone or read the Markdown. The report includes linked viewer quotes; inspect the draft replies and AI findings before using them.
 
 To explicitly run and send the report to the configured opt-in recipients:
 
@@ -58,9 +58,9 @@ The scanner is a best-effort guard, not a substitute for keeping secrets out of 
 
 ## Configuration and costs
 
-`provider` may be `gemini`, `anthropic`, `openai`, or `mock` (the mock provider is for tests and local development only). Each channel needs exactly one of `handle` or `channelId`, a `creatorName`, `creatorGoal` (`sell_course`, `sell_tool`, `sponsorships`, or `grow_audience`), and a non-empty `recipients` list. Optional `productKeywords` help classify relevant inquiries. `limits` controls videos (default 8), comment threads per video (default 300), and estimated LLM spend per run/day (defaults $0.50/$2.00). Adjust these caps to suit the account and provider. YouTube quota units and model token/cost figures are estimates; provider pricing and quota rules can change. Run `cost` to see locally recorded usage for the current UTC day.
+`provider` may be `gemini`, `anthropic`, `openai`, or `mock` (the mock provider is for tests and local development only). Set `model` to a model available for the selected provider; `fallbackModel` is optional and is used after four 429/503 retries on the primary model. Each channel needs exactly one of `handle` or `channelId`, a `creatorName`, `creatorGoal` (`sell_course`, `sell_tool`, `sponsorships`, or `grow_audience`), and a non-empty `recipients` list. Optional `productKeywords` help classify relevant inquiries. `limits` controls videos (default 8), comment threads per video (default 300), and estimated LLM spend per run/day (defaults $0.50/$2.00). Adjust these caps to suit the account and provider. YouTube quota units and model token/cost figures are estimates; provider pricing and quota rules can change. Run `cost` to see locally recorded usage for the current UTC day.
 
-The program batches comments and checks the estimate against the configured spend caps before each LLM call. It retries transient network/server failures with backoff and stops without retrying quota/rate-limit exhaustion. Comment text is cached only as needed and cache files older than 30 days can be removed with `purge`; the retention rule applies to cached raw comment text, not reports you choose to keep.
+The program batches comments and checks the estimate against the configured spend caps before each LLM call. It retries transient network/server failures with backoff and stops without retrying quota exhaustion. Invalid JSON or schema output is retried once with a stricter reminder; a failed batch is recorded in `stats.json`, and runs with more than 30% failed batches stop without creating a report. Comment text is cached only as needed and cache files older than 30 days can be removed with `purge`; the retention rule applies to cached raw comment text, not reports you choose to keep.
 
 ## How to read the report
 
@@ -69,7 +69,7 @@ The program batches comments and checks the estimate against the configured spen
 - **Fix list:** confusion, apparent broken/missing links, and recurring complaints, with a video and any available timestamp.
 - **Proof pack:** selected viewer testimonials/results. Ordering is tailored to the creator goal.
 
-“How to read this” notes that the analysis is AI-generated. Viewers' exact words, counts, and links come from fetched data; any generated quote that is not an exact substring of its source comment is excluded with a warning.
+“How to read this” notes that the analysis is AI-generated. Counts and links come from fetched data; quotes are kept only when they match the fetched source comment after Unicode, whitespace, and HTML-entity normalization.
 
 ## Troubleshooting
 

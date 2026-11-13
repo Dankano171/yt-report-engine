@@ -82,6 +82,58 @@ describe("comment analysis safety", () => {
     expect(result.stoppedReason).toMatch(/spend limit/i);
     expect(fetcher).not.toHaveBeenCalled();
   });
+
+  it("switches to the configured fallback model after five rate-limited requests", async () => {
+    const models: string[] = [];
+    const result = await analyzeComments([comment], {
+      provider: "openai",
+      model: "primary-model",
+      fallbackModel: "fallback-model",
+      apiKey: "test-key",
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      wait: async () => {},
+      fetcher: async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { model: string };
+        models.push(body.model);
+        if (body.model === "primary-model")
+          return new Response(JSON.stringify({ error: { message: "busy" } }), {
+            status: 429,
+          });
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    classifications: [
+                      {
+                        commentId: "c1",
+                        category: "how_to_question",
+                        quote: "How do I use this?",
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      },
+    });
+    expect(models).toEqual([
+      "primary-model",
+      "primary-model",
+      "primary-model",
+      "primary-model",
+      "primary-model",
+      "fallback-model",
+    ]);
+    expect(result.classifications).toHaveLength(1);
+    expect(result.successfulBatches).toBe(1);
+  });
 });
 
 describe("report generation", () => {
@@ -111,6 +163,41 @@ describe("report generation", () => {
     expect(report.markdown).toContain("How do I use this?");
     expect(report.markdown).not.toContain("Not present");
     expect(warning).toHaveBeenCalledOnce();
+  });
+
+  it("matches quotes after Unicode, whitespace, and HTML-entity normalization", () => {
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [{ ...comment, text: "A cafe\u0301 & tea" }],
+      classifications: [
+        {
+          commentId: "c1",
+          category: "praise",
+          quote: "A&nbsp;café&nbsp;&amp;&nbsp;tea",
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.verifiedClassifications).toHaveLength(1);
+    expect(report.droppedQuotes.quoteNotFound).toBe(0);
+  });
+
+  it("does not claim empty sections when classification was incomplete", () => {
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [comment],
+      classifications: [],
+      classificationSucceeded: false,
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).not.toContain(
+      "No testimonial or result comment identified",
+    );
+    expect(report.markdown).toContain(
+      "Not reported because classification did not complete successfully",
+    );
   });
 
   it("renders a concise not-enough-data report for empty results", () => {

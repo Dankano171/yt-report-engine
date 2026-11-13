@@ -42,6 +42,8 @@ export type ClassificationResult = Classification[];
 
 interface LlmOptions {
   provider: ProviderName;
+  model?: string;
+  fallbackModel?: string;
   apiKey?: string;
   fetcher?: Fetcher;
   usagePath?: string;
@@ -52,12 +54,34 @@ interface LlmOptions {
   batchSize?: number;
   wait?: (milliseconds: number) => Promise<void>;
   onUsage?: (record: UsageRecord) => Promise<void>;
+  onProgress?: (message: string) => void;
+  onBatchEvent?: (event: BatchEvent) => void;
+}
+
+export interface BatchEvent {
+  batch: number;
+  totalBatches: number;
+  attempt: number;
+  outcome:
+    "success" | "retry" | "json_parse_failure" | "schema_validation_failure";
+  reason?: string;
+  model?: string;
+}
+
+export interface FailedBatch {
+  batch: number;
+  reason: "json_parse_failure" | "schema_validation_failure";
 }
 
 export interface AnalysisResult {
   classifications: ClassificationResult;
   usage: UsageRecord;
   stoppedReason?: string;
+  batchCount: number;
+  successfulBatches: number;
+  failedBatches: FailedBatch[];
+  commentsSentToLlm: number;
+  classificationSucceeded: boolean;
 }
 
 const pricingPerMillion: Record<
@@ -178,98 +202,131 @@ function extractText(
 
 async function requestProvider(
   provider: Exclude<ProviderName, "mock">,
+  model: string,
+  fallbackModel: string | undefined,
   apiKey: string,
   prompt: string,
   outputTokenLimit: number,
   fetcher: Fetcher,
   wait: (milliseconds: number) => Promise<void>,
-): Promise<{ text: string; input: number; output: number }> {
+  onRetry: (model: string, attempt: number, status: number) => void,
+): Promise<{ text: string; input: number; output: number; model: string }> {
   let url: string;
   let headers: Record<string, string>;
   let body: Record<string, unknown>;
-  if (provider === "gemini") {
-    url =
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-    headers = { "content-type": "application/json", "x-goog-api-key": apiKey };
-    body = {
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: "application/json",
+  const configuredModels = [
+    model,
+    ...(fallbackModel && fallbackModel !== model ? [fallbackModel] : []),
+  ];
+  let latestStatus = 0;
+  let latestMessage = "LLM request failed.";
+  for (const [modelIndex, selectedModel] of configuredModels.entries()) {
+    if (provider === "gemini") {
+      url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(selectedModel)}:generateContent`;
+      headers = {
+        "content-type": "application/json",
+        "x-goog-api-key": apiKey,
+      };
+      body = {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.1,
+          maxOutputTokens: outputTokenLimit,
+        },
+      };
+    } else if (provider === "anthropic") {
+      url = "https://api.anthropic.com/v1/messages";
+      headers = {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      };
+      body = {
+        model: selectedModel,
+        max_tokens: outputTokenLimit,
+        messages: [{ role: "user", content: prompt }],
+      };
+    } else {
+      url = "https://api.openai.com/v1/chat/completions";
+      headers = {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`,
+      };
+      body = {
+        model: selectedModel,
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+        max_tokens: outputTokenLimit,
         temperature: 0.1,
-        maxOutputTokens: outputTokenLimit,
-      },
-    };
-  } else if (provider === "anthropic") {
-    url = "https://api.anthropic.com/v1/messages";
-    headers = {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    };
-    body = {
-      model: "claude-3-5-haiku-latest",
-      max_tokens: outputTokenLimit,
-      messages: [{ role: "user", content: prompt }],
-    };
-  } else {
-    url = "https://api.openai.com/v1/chat/completions";
-    headers = {
-      "content-type": "application/json",
-      authorization: `Bearer ${apiKey}`,
-    };
-    body = {
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      response_format: { type: "json_object" },
-      max_tokens: outputTokenLimit,
-      temperature: 0.1,
-    };
-  }
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    let response: Response;
-    try {
-      response = await fetcher(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
-    } catch (error) {
-      if (attempt === 2)
+      };
+    }
+
+    for (let attempt = 0; attempt <= 4; attempt += 1) {
+      let response: Response;
+      try {
+        response = await fetcher(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+      } catch (error) {
+        if (attempt < 2) {
+          onRetry(selectedModel, attempt + 1, 0);
+          await wait(250 * 2 ** attempt);
+          continue;
+        }
         throw new Error(
           redactSecrets(error instanceof Error ? error.message : String(error)),
         );
-      await wait(250 * 2 ** attempt);
-      continue;
+      }
+      let responseBody: unknown;
+      try {
+        responseBody = await response.json();
+      } catch {
+        responseBody = {};
+      }
+      if (response.ok)
+        return { ...extractText(provider, responseBody), model: selectedModel };
+      const root =
+        responseBody && typeof responseBody === "object"
+          ? (responseBody as Record<string, unknown>)
+          : {};
+      const errorObj =
+        root.error && typeof root.error === "object"
+          ? (root.error as Record<string, unknown>)
+          : {};
+      latestStatus = response.status;
+      latestMessage = redactSecrets(
+        String(
+          errorObj.message ?? response.statusText ?? "LLM request failed.",
+        ),
+      );
+      if (response.status === 429 || response.status === 503) {
+        if (attempt < 4) {
+          onRetry(selectedModel, attempt + 1, response.status);
+          await wait(250 * 2 ** attempt);
+          continue;
+        }
+        if (modelIndex + 1 < configuredModels.length) break;
+        if (response.status === 429)
+          throw new QuotaError(
+            `LLM quota/rate limit reached: ${latestMessage}`,
+          );
+      } else if (response.status === 402) {
+        throw new QuotaError(`LLM quota/rate limit reached: ${latestMessage}`);
+      } else {
+        throw new Error(
+          `LLM provider request failed (${response.status}): ${latestMessage}`,
+        );
+      }
     }
-    let responseBody: unknown;
-    try {
-      responseBody = await response.json();
-    } catch {
-      responseBody = {};
-    }
-    if (response.ok) return extractText(provider, responseBody);
-    const root =
-      responseBody && typeof responseBody === "object"
-        ? (responseBody as Record<string, unknown>)
-        : {};
-    const errorObj =
-      root.error && typeof root.error === "object"
-        ? (root.error as Record<string, unknown>)
-        : {};
-    const message = redactSecrets(
-      String(errorObj.message ?? response.statusText ?? "LLM request failed."),
-    );
-    if (response.status === 429 || response.status === 402)
-      throw new QuotaError(`LLM quota/rate limit reached: ${message}`);
-    if (response.status >= 500 && attempt < 2) {
-      await wait(250 * 2 ** attempt);
-      continue;
-    }
-    throw new Error(
-      `LLM provider request failed (${response.status}): ${message}`,
-    );
   }
-  throw new Error("LLM provider request failed after retries.");
+  if (latestStatus === 429)
+    throw new QuotaError(`LLM quota/rate limit reached: ${latestMessage}`);
+  throw new Error(
+    `LLM provider request failed (${latestStatus}): ${latestMessage}`,
+  );
 }
 
 function mockClassifications(comments: CommentRecord[]): ClassificationResult {
@@ -324,6 +381,10 @@ export async function analyzeComments(
   };
   const classifications: ClassificationResult = [];
   const batchSize = options.batchSize ?? 20;
+  const batchCount = Math.ceil(comments.length / batchSize);
+  let successfulBatches = 0;
+  let commentsSentToLlm = 0;
+  const failedBatches: FailedBatch[] = [];
   const fetcher = options.fetcher ?? fetch;
   const wait =
     options.wait ??
@@ -331,6 +392,8 @@ export async function analyzeComments(
       new Promise((resolve) => setTimeout(resolve, milliseconds)));
   for (let offset = 0; offset < comments.length; offset += batchSize) {
     const batch = comments.slice(offset, offset + batchSize);
+    const batchNumber = Math.floor(offset / batchSize) + 1;
+    options.onProgress?.(`Classifying batch ${batchNumber} of ${batchCount}.`);
     const prompt = buildClassificationPrompt(batch);
     const inputEstimate = estimateTokens(prompt);
     const outputEstimate = batch.length * 100;
@@ -348,6 +411,11 @@ export async function analyzeComments(
         usage: priorRun,
         stoppedReason:
           "The configured LLM spend limit was reached; remaining comments were not analyzed.",
+        batchCount,
+        successfulBatches,
+        failedBatches,
+        commentsSentToLlm,
+        classificationSucceeded: false,
       };
     }
     let result: ClassificationResult;
@@ -360,37 +428,122 @@ export async function analyzeComments(
     } else {
       if (!options.apiKey)
         throw new Error("LLM_API_KEY is required for the selected provider.");
-      const response = await requestProvider(
-        options.provider,
-        options.apiKey,
-        prompt,
-        outputEstimate,
-        fetcher,
-        wait,
-      );
-      let json: unknown;
-      try {
-        json = JSON.parse(response.text);
-      } catch {
-        throw new Error("LLM provider returned invalid JSON.");
-      }
-      const parsed = resultSchema.safeParse(json);
-      if (!parsed.success)
-        throw new Error(
-          "LLM provider returned JSON that did not match the required schema.",
+      if (!options.model)
+        throw new Error("model is required for the selected LLM provider.");
+      commentsSentToLlm += batch.length;
+      let validResult:
+        | {
+            result: ClassificationResult;
+            inputTokens: number;
+            outputTokens: number;
+          }
+        | undefined;
+      let finalFailure: FailedBatch["reason"] = "json_parse_failure";
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const strictReminder =
+          attempt === 2
+            ? "\nSTRICT FORMAT REMINDER: Your previous response was invalid. Return exactly one JSON object with a classifications array. Every item must match the specified schema; do not include markdown or extra fields."
+            : "";
+        const response = await requestProvider(
+          options.provider,
+          options.model,
+          options.fallbackModel,
+          options.apiKey,
+          `${prompt}${strictReminder}`,
+          outputEstimate,
+          fetcher,
+          wait,
+          (model, retry, status) =>
+            options.onBatchEvent?.({
+              batch: batchNumber,
+              totalBatches: batchCount,
+              attempt,
+              outcome: "retry",
+              reason: `HTTP ${status}, retry ${retry} on ${model}`,
+              model,
+            }),
         );
-      result = parsed.data.classifications.map((item) => ({
-        commentId: item.commentId,
-        category: item.category,
-        quote: item.quote,
-        ...(item.timestamp !== undefined ? { timestamp: item.timestamp } : {}),
-        ...(item.draftReply !== undefined
-          ? { draftReply: item.draftReply }
-          : {}),
-        ...(item.idea !== undefined ? { idea: item.idea } : {}),
-      }));
-      inputTokens = response.input || inputEstimate;
-      outputTokens = response.output || estimateTokens(response.text);
+        let json: unknown;
+        try {
+          json = JSON.parse(response.text);
+        } catch {
+          finalFailure = "json_parse_failure";
+          options.onBatchEvent?.({
+            batch: batchNumber,
+            totalBatches: batchCount,
+            attempt,
+            outcome: "json_parse_failure",
+            reason: "Response was not valid JSON",
+            model: response.model,
+          });
+          if (attempt === 1)
+            options.onBatchEvent?.({
+              batch: batchNumber,
+              totalBatches: batchCount,
+              attempt,
+              outcome: "retry",
+              reason: "Retrying with strict JSON reminder",
+              model: response.model,
+            });
+          continue;
+        }
+        const parsed = resultSchema.safeParse(json);
+        if (!parsed.success) {
+          finalFailure = "schema_validation_failure";
+          options.onBatchEvent?.({
+            batch: batchNumber,
+            totalBatches: batchCount,
+            attempt,
+            outcome: "schema_validation_failure",
+            reason: "Response did not match the classification schema",
+            model: response.model,
+          });
+          if (attempt === 1)
+            options.onBatchEvent?.({
+              batch: batchNumber,
+              totalBatches: batchCount,
+              attempt,
+              outcome: "retry",
+              reason: "Retrying with strict schema reminder",
+              model: response.model,
+            });
+          continue;
+        }
+        validResult = {
+          result: parsed.data.classifications.map((item) => ({
+            commentId: item.commentId,
+            category: item.category,
+            quote: item.quote,
+            ...(item.timestamp !== undefined
+              ? { timestamp: item.timestamp }
+              : {}),
+            ...(item.draftReply !== undefined
+              ? { draftReply: item.draftReply }
+              : {}),
+            ...(item.idea !== undefined ? { idea: item.idea } : {}),
+          })),
+          inputTokens: response.input || inputEstimate,
+          outputTokens: response.output || estimateTokens(response.text),
+        };
+        options.onBatchEvent?.({
+          batch: batchNumber,
+          totalBatches: batchCount,
+          attempt,
+          outcome: "success",
+          model: response.model,
+        });
+        break;
+      }
+      if (!validResult) {
+        failedBatches.push({ batch: batchNumber, reason: finalFailure });
+        console.warn(
+          `Warning: classification batch ${batchNumber} of ${batchCount} failed after retry (${finalFailure.replaceAll("_", " ")}).`,
+        );
+        continue;
+      }
+      result = validResult.result;
+      inputTokens = validResult.inputTokens;
+      outputTokens = validResult.outputTokens;
     }
     priorRun.llmInputTokens += inputTokens;
     priorRun.llmOutputTokens += outputTokens;
@@ -416,8 +569,22 @@ export async function analyzeComments(
         usage: priorRun,
         stoppedReason:
           "Actual reported usage reached the configured LLM spend limit; remaining comments were not analyzed.",
+        batchCount,
+        successfulBatches,
+        failedBatches,
+        commentsSentToLlm,
+        classificationSucceeded: false,
       };
     }
+    successfulBatches += 1;
   }
-  return { classifications, usage: priorRun };
+  return {
+    classifications,
+    usage: priorRun,
+    batchCount,
+    successfulBatches,
+    failedBatches,
+    commentsSentToLlm,
+    classificationSucceeded: failedBatches.length === 0,
+  };
 }

@@ -20,19 +20,33 @@ const channelSchema = z
     message: "Each channel must set exactly one of handle or channelId",
   });
 
-const configSchema = z.object({
-  provider: z.enum(["gemini", "anthropic", "openai", "mock"]).default("gemini"),
-  emailFrom: z.string().min(1).optional(),
-  limits: z
-    .object({
-      maxVideos: z.number().int().min(1).max(50).default(8),
-      maxThreadsPerVideo: z.number().int().min(1).max(300).default(300),
-      maxUsdPerRun: z.number().nonnegative().default(0.5),
-      maxUsdPerDay: z.number().nonnegative().default(2),
-    })
-    .default({}),
-  channels: z.array(channelSchema).min(1),
-});
+const configSchema = z
+  .object({
+    provider: z
+      .enum(["gemini", "anthropic", "openai", "mock"])
+      .default("gemini"),
+    model: z.string().min(1).optional(),
+    fallbackModel: z.string().min(1).optional(),
+    emailFrom: z.string().min(1).optional(),
+    limits: z
+      .object({
+        maxVideos: z.number().int().min(1).max(50).default(8),
+        maxThreadsPerVideo: z.number().int().min(1).max(300).default(300),
+        maxUsdPerRun: z.number().nonnegative().default(0.5),
+        maxUsdPerDay: z.number().nonnegative().default(2),
+      })
+      .default({}),
+    channels: z.array(channelSchema).min(1),
+  })
+  .superRefine((value, context) => {
+    if (value.provider !== "mock" && !value.model) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "model is required when using an LLM provider",
+        path: ["model"],
+      });
+    }
+  });
 
 export async function loadConfig(path = "config.json"): Promise<AppConfig> {
   let contents: string;
@@ -58,6 +72,8 @@ export async function loadConfig(path = "config.json"): Promise<AppConfig> {
   const data = result.data;
   return {
     provider: data.provider,
+    ...(data.model ? { model: data.model } : {}),
+    ...(data.fallbackModel ? { fallbackModel: data.fallbackModel } : {}),
     ...(data.emailFrom ? { emailFrom: data.emailFrom } : {}),
     limits: data.limits,
     channels: data.channels.map((channel) => ({
