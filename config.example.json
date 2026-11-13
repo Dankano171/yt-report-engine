@@ -1,0 +1,19 @@
+{
+  "provider": "gemini",
+  "emailFrom": "Creator Reports <reports@your-verified-domain.example>",
+  "limits": {
+    "maxVideos": 8,
+    "maxThreadsPerVideo": 300,
+    "maxUsdPerRun": 0.5,
+    "maxUsdPerDay": 2
+  },
+  "channels": [
+    {
+      "handle": "@examplecreator",
+      "creatorName": "Example Creator",
+      "creatorGoal": "grow_audience",
+      "recipients": ["you@example.com"],
+      "productKeywords": ["Example product"]
+    }
+  ]
+}

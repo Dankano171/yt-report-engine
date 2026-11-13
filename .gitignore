@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+coverage/
+output/
+cache/
+usage_logs/
+config.json
+*.log
