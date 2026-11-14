@@ -1,4 +1,11 @@
-const lowInformationPhrases = new Set(["thanks", "thx", "ty"]);
+const lowInformationPhrases = new Set([
+  "thanks",
+  "thx",
+  "ty",
+  "i m tired boss",
+  "im tired boss",
+  "i am tired boss",
+]);
 
 export function normalizeKeywordResponse(text: string): string {
   return text
@@ -78,7 +85,15 @@ export function isLowInformationComment(text: string): boolean {
     .toLowerCase()
     .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
     .trim();
-  if (lowInformationPhrases.has(normalized)) return true;
+  const mentionsVideoCreatorOrProduct =
+    /\b(?:video|creator|channel|product|course|lesson|tutorial|app|tool|software)\b/u.test(
+      normalized,
+    );
+  if (
+    lowInformationPhrases.has(normalized) ||
+    /\b(?:im|i m|i am) tired(?: boss)?\b/u.test(normalized)
+  )
+    return !mentionsVideoCreatorOrProduct;
   return /^[\p{Extended_Pictographic}\p{Emoji_Component}\p{White_Space}\p{Punctuation}\p{Symbol}]+$/u.test(
     text,
   );

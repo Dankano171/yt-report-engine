@@ -345,6 +345,11 @@ export async function clusterReportSections(
   onUsage?: (record: UsageRecord) => Promise<void>,
   reserveUsd?: (estimate: number) => boolean,
   onFallback?: (section: ReportSection, reason: string) => void,
+  onChunkCall?: (
+    section: ReportSection,
+    chunkSize: number,
+    retry: boolean,
+  ) => void,
 ): Promise<ReportClusters> {
   const findings = findingList(input).findings;
   const moneyIds = new Set(
@@ -413,6 +418,8 @@ export async function clusterReportSections(
           fallbackReason = reason;
           onFallback?.(section, reason);
         },
+        onChunkCall: (chunkSize, retry) =>
+          onChunkCall?.(section, chunkSize, retry),
       }),
       commentIds: comments.map((comment) => comment.commentId),
       ...(fallbackReason ? { fallbackReason } : {}),
@@ -606,32 +613,133 @@ function groundedParaphrase(group: FindingGroup): string | undefined {
     : undefined;
 }
 
-function sourceSnippet(source: string, words: string[]): string | undefined {
+const relatedSnippetStopWords = new Set([
+  "about",
+  "after",
+  "again",
+  "also",
+  "and",
+  "are",
+  "because",
+  "been",
+  "before",
+  "being",
+  "between",
+  "both",
+  "but",
+  "can",
+  "could",
+  "did",
+  "does",
+  "doing",
+  "during",
+  "each",
+  "for",
+  "from",
+  "had",
+  "has",
+  "have",
+  "her",
+  "here",
+  "him",
+  "his",
+  "how",
+  "into",
+  "its",
+  "just",
+  "more",
+  "most",
+  "not",
+  "our",
+  "out",
+  "over",
+  "please",
+  "same",
+  "she",
+  "should",
+  "some",
+  "such",
+  "than",
+  "that",
+  "the",
+  "their",
+  "them",
+  "then",
+  "there",
+  "these",
+  "they",
+  "this",
+  "those",
+  "through",
+  "under",
+  "until",
+  "was",
+  "were",
+  "what",
+  "when",
+  "where",
+  "which",
+  "while",
+  "who",
+  "with",
+  "would",
+  "you",
+  "your",
+]);
+
+function meaningfulWords(text: string): Set<string> {
+  return new Set(
+    (text.toLocaleLowerCase().match(/\p{L}{3,}/gu) ?? []).filter(
+      (word) => !relatedSnippetStopWords.has(word),
+    ),
+  );
+}
+
+function sourceSnippet(
+  source: string,
+  commentWords: Set<string>,
+): string | undefined {
   const sentences = source.match(/[^.!?\n]+[.!?]?/g) ?? [];
   for (const sentence of sentences) {
-    const normalized = sentence.toLocaleLowerCase();
-    if (!words.some((word) => normalized.includes(word))) continue;
-    const trimmed = sentence.trim();
-    if (!trimmed) continue;
-    if (trimmed.length <= 120) return trimmed;
-    const prefix = trimmed.slice(0, 119);
-    const boundary = prefix.lastIndexOf(" ");
-    return `${prefix.slice(0, boundary > 0 ? boundary : prefix.length)}…`;
+    const urlIndex = sentence.search(/(?:https?:\/\/|www\.)/iu);
+    const withoutUrl = urlIndex >= 0 ? sentence.slice(0, urlIndex) : sentence;
+    const content = withoutUrl.trim();
+    if (!content) continue;
+
+    const tokens = [...content.matchAll(/\p{L}{3,}/gu)].map((match) => ({
+      word: match[0]!.toLocaleLowerCase(),
+      start: match.index!,
+      end: match.index! + match[0]!.length,
+    }));
+    const matchingTokens = tokens.filter(
+      ({ word }) =>
+        commentWords.has(word) && !relatedSnippetStopWords.has(word),
+    );
+    if (new Set(matchingTokens.map(({ word }) => word)).size < 2) continue;
+    if (content.length <= 120) return content;
+
+    const first = matchingTokens[0]!;
+    const last = matchingTokens.at(-1)!;
+    if (last.end - first.start > 120) continue;
+    const contextStart = Math.max(0, first.start - 32);
+    const precedingSpace = content.lastIndexOf(" ", contextStart);
+    let start = precedingSpace >= 0 ? precedingSpace + 1 : first.start;
+    if (last.end - start > 120) start = first.start;
+    const endLimit = Math.min(content.length, start + 120);
+    let end = content.lastIndexOf(" ", endLimit);
+    if (end < last.end) end = last.end;
+    const snippet = content.slice(start, end).trim();
+    if (snippet.length <= 120 && source.includes(snippet)) return snippet;
   }
   return undefined;
 }
 
-function answerSource(finding: Finding): string | undefined {
-  const words =
-    finding.comment.text.toLocaleLowerCase().match(/[\p{L}\p{N}]{4,}/gu) ?? [];
+function relatedDescription(finding: Finding): string | undefined {
+  const words = meaningfulWords(finding.comment.text);
   const description = finding.video.description;
   const descriptionSnippet = sourceSnippet(description, words);
   if (descriptionSnippet && description.includes(descriptionSnippet))
-    return `video description: “${descriptionSnippet}”`;
-  const reply = finding.comment.creatorReplyText ?? "";
-  const replySnippet = sourceSnippet(reply, words);
-  if (replySnippet && reply.includes(replySnippet))
-    return `creator reply: “${replySnippet}”`;
+    return descriptionSnippet;
   return undefined;
 }
 
@@ -878,10 +986,10 @@ function renderMarkdown(
       const viewerAsk = groundedParaphrase(group);
       return `- **${title}** — ${group.viewers} viewer${group.viewers === 1 ? "" : "s"} · ${group.findings.length} comment${group.findings.length === 1 ? "" : "s"}${viewerAsk ? `\n\nViewer asks: ${viewerAsk}` : ""}\n\n${examples
         .map((finding) => {
-          const answer = answerSource(finding);
+          const related = relatedDescription(finding);
           return [
             `[Open comment](${finding.link}) on **${escapeMarkdown(finding.video.title)}**`,
-            answer ? `Answer found in: ${answer}.` : "",
+            related ? `Related in description: “${related}”` : "",
             quoteBlock(finding.classification.quote),
           ]
             .filter(Boolean)

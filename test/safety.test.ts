@@ -76,11 +76,34 @@ function openAiResponse(content: string): Response {
 }
 
 describe("comment analysis safety", () => {
-  it("does not preclassify meaningful multi-word comments as noise", () => {
+  it("treats context-free tired expressions as noise, but not video-specific feedback", async () => {
     expect(isLowInformationComment("Full course")).toBe(false);
     expect(isLowInformationComment("Thank you")).toBe(false);
     expect(isLowInformationComment("thanks")).toBe(true);
     expect(isLowInformationComment("🔥🔥")).toBe(true);
+    expect(isLowInformationComment("im tired boss")).toBe(true);
+    expect(isLowInformationComment("im tired boss about this video")).toBe(
+      false,
+    );
+    const analysis = await analyzeComments(
+      [
+        { ...comment, text: "im tired boss" },
+        {
+          ...comment,
+          commentId: "video-feedback",
+          text: "im tired boss about this video",
+        },
+      ],
+      {
+        provider: "mock",
+        maxUsdPerRun: 1,
+        maxUsdPerDay: 1,
+      },
+    );
+    expect(analysis.classifications.map(({ category }) => category)).toEqual([
+      "spam_or_noise",
+      "praise",
+    ]);
   });
 
   it("clearly delimits untrusted comments and instructs the model to ignore embedded instructions", () => {
@@ -149,6 +172,110 @@ describe("comment analysis safety", () => {
         paraphrase: "Viewers ask how to set up the lesson.",
       },
     ]);
+  });
+
+  it("clusters 19 comments in three calls of at most eight and maps all titles", async () => {
+    const comments = Array.from({ length: 19 }, (_, index) => ({
+      ...comment,
+      commentId: `youtube-comment-${index + 1}`,
+      text: `How do I access project materials number ${index + 1}?`,
+    }));
+    const chunkSizes: number[] = [];
+    const requestSizes: number[] = [];
+    const fetcher: Fetcher = async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        messages: { content: string }[];
+      };
+      const prompt = request.messages[0]!.content;
+      const dataStart = prompt.indexOf("COMMENT DATA START");
+      const dataEnd = prompt.indexOf("COMMENT DATA END");
+      const dataJsonStart = prompt.indexOf("\n", dataStart) + 1;
+      const chunk = JSON.parse(prompt.slice(dataJsonStart, dataEnd).trim()) as {
+        id: number;
+        text: string;
+      }[];
+      requestSizes.push(chunk.length);
+      return openAiResponse(
+        JSON.stringify(
+          chunk.map(({ id }) => ({
+            title: `Project material topic ${id}`,
+            ids: [id],
+          })),
+        ),
+      );
+    };
+    const clusters = await clusterComments(comments, {
+      provider: "openai",
+      model: "writer",
+      apiKey: "test-key",
+      fetcher,
+      section: "ideas",
+      onChunkCall: (size) => chunkSizes.push(size),
+    });
+    expect(chunkSizes).toEqual([8, 8, 3]);
+    expect(requestSizes).toEqual(chunkSizes);
+    expect(clusters).toHaveLength(19);
+    expect(
+      clusters.flatMap((cluster) => cluster.ids).sort((a, b) => a - b),
+    ).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
+    expect(
+      clusters.every((cluster) =>
+        cluster.title.startsWith("Project material topic"),
+      ),
+    ).toBe(true);
+  });
+
+  it("retries invalid cluster JSON in chunks of four once", async () => {
+    const comments = Array.from({ length: 8 }, (_, index) => ({
+      ...comment,
+      commentId: `c${index + 1}`,
+      text: `How do I use the sample ${index + 1}?`,
+    }));
+    const chunkSizes: number[] = [];
+    const requestSizes: number[] = [];
+    const retryFlags: boolean[] = [];
+    let calls = 0;
+    const fetcher: Fetcher = async (_input, init) => {
+      calls += 1;
+      const request = JSON.parse(String(init?.body)) as {
+        messages: { content: string }[];
+      };
+      const prompt = request.messages[0]!.content;
+      const dataStart = prompt.indexOf("COMMENT DATA START");
+      const dataEnd = prompt.indexOf("COMMENT DATA END");
+      const dataJsonStart = prompt.indexOf("\n", dataStart) + 1;
+      const chunk = JSON.parse(prompt.slice(dataJsonStart, dataEnd).trim()) as {
+        id: number;
+      }[];
+      requestSizes.push(chunk.length);
+      if (calls === 1) return openAiResponse("not json");
+      return openAiResponse(
+        JSON.stringify(
+          chunk.map(({ id }) => ({
+            title: `Sample topic ${id}`,
+            ids: [id],
+          })),
+        ),
+      );
+    };
+    const clusters = await clusterComments(comments, {
+      provider: "openai",
+      model: "writer",
+      apiKey: "test-key",
+      fetcher,
+      section: "ideas",
+      onChunkCall: (size, retry) => {
+        chunkSizes.push(size);
+        retryFlags.push(retry);
+      },
+    });
+    expect(chunkSizes).toEqual([8, 4, 4]);
+    expect(requestSizes).toEqual(chunkSizes);
+    expect(retryFlags).toEqual([false, true, true]);
+    expect(calls).toBe(3);
+    expect(
+      clusters.flatMap((cluster) => cluster.ids).sort((a, b) => a - b),
+    ).toEqual(Array.from({ length: 8 }, (_, index) => index + 1));
   });
 
   it("detects repeated keyword responses across leading-phrase variants", () => {
@@ -1297,13 +1424,13 @@ describe("report generation", () => {
     expect(report.reportDestinationCounts.ideas).toBe(1);
   });
 
-  it("includes only a verbatim source snippet when an answer source is available", () => {
+  it("shows a verbatim related description snippet with shared meaningful words", () => {
     const actionable = {
       ...comment,
       text: "What are the pricing details in the pinned guide?",
     };
     const description =
-      "Pricing details are in the pinned guide. Other unrelated information follows.";
+      "Introductory paragraph unrelated to the viewer's question. Pricing details for the member account are available in the linked guide with comprehensive instructions for enrollment, access, and billing; consult the resource page for current conditions and examples before proceeding through each step and review the included materials carefully https://example.test/guide/very-long-path";
     const report = renderReport({
       channel,
       videos: [{ ...video, description }],
@@ -1320,10 +1447,39 @@ describe("report generation", () => {
 
     const answerLine = report.markdown
       .split("\n")
-      .find((line) => line.startsWith("Answer found in:"));
-    expect(answerLine).toContain("Pricing details are in the pinned guide.");
-    expect(description).toContain("Pricing details are in the pinned guide.");
-    expect(answerLine?.length).toBeLessThan(150);
+      .find((line) => line.startsWith("Related in description:"));
+    expect(answerLine).toContain("Pricing details");
+    expect(answerLine).not.toContain("Introductory paragraph");
+    expect(answerLine).not.toContain("https://");
+    expect(answerLine).not.toContain("answer");
+    const snippet =
+      answerLine?.slice("Related in description: “".length, -1) ?? "";
+    expect(snippet.length).toBeLessThanOrEqual(120);
+    expect(description).toContain(snippet);
+  });
+
+  it("omits a related description note when fewer than two meaningful words overlap", () => {
+    const text = "What is the pricing?";
+    const report = renderReport({
+      channel,
+      videos: [
+        {
+          ...video,
+          description:
+            "Pricing details are listed here. This unrelated paragraph explains nothing.",
+        },
+      ],
+      comments: [{ ...comment, text }],
+      classifications: [
+        {
+          commentId: comment.commentId,
+          category: "buying_or_sponsor_inquiry",
+          quote: text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).not.toContain("Related in description:");
   });
 
   it("uses singular grammar for one keyword-response viewer", () => {

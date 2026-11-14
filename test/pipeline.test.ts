@@ -396,6 +396,100 @@ describe("run pipeline", () => {
     expect(markdown).not.toContain("comment4");
     expect(markdown).not.toContain("comment5");
   });
+
+  it("records three eight-or-fewer clustering calls for 19 report comments", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-clustering-chunks-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-key";
+    process.env.LLM_API_KEY = "test-llm-key";
+    const youtubeFetcher = fetcher(19);
+    const clusterChunkSizes: number[] = [];
+    let writingCalls = 0;
+    const mockFetcher: Fetcher = async (input, init) => {
+      if (new URL(String(input)).hostname === "www.googleapis.com")
+        return youtubeFetcher(input, init);
+      const request = JSON.parse(String(init?.body)) as {
+        messages: { content: string }[];
+      };
+      const prompt = request.messages[0]?.content ?? "";
+      const marker = prompt.indexOf("COMMENT DATA START");
+      const endMarker = prompt.indexOf("COMMENT DATA END");
+      const dataStart = prompt.indexOf("\n", marker) + 1;
+      const supplied = JSON.parse(
+        prompt.slice(dataStart, endMarker).trim(),
+      ) as { id: number }[];
+      if (prompt.includes("TOPIC CLUSTERING TASK")) {
+        writingCalls += 1;
+        clusterChunkSizes.push(supplied.length);
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify(
+                    supplied.map(({ id }) => ({
+                      title: `Topic specifics number ${id}`,
+                      ids: [id],
+                    })),
+                  ),
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify(
+                  supplied.map(({ id }) => ({
+                    id,
+                    category: "how_to_question",
+                    timestamp: null,
+                  })),
+                ),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    };
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const result = await runChannel({
+      channel,
+      config: { ...config, provider: "openai", model: "test-model" },
+      days: 30,
+      send: false,
+      debug: true,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: mockFetcher,
+      wait: async () => {},
+    });
+    expect(writingCalls).toBe(3);
+    expect(clusterChunkSizes).toEqual([8, 8, 3]);
+    expect(result.stats.clustering).toEqual({
+      calls: 3,
+      retryCalls: 0,
+      chunkSizes: [8, 8, 3],
+    });
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Writing cluster call: section=ideas, comments=8",
+      ),
+    );
+    const markdown = await readFile(
+      join(result.reportFolder, "report.md"),
+      "utf8",
+    );
+    expect(markdown.match(/Topic specifics number \d+/g)).toHaveLength(19);
+  });
+
   it("classifies only the first batch and writes diagnostic stats without a report", async () => {
     root = await mkdtemp(join(tmpdir(), "yt-report-classify-only-"));
     process.env.YOUTUBE_API_KEY = "test-key";

@@ -204,8 +204,9 @@ export function buildClassificationPrompt(comments: CommentRecord[]): string {
   }));
   return [
     `Classify every comment using exactly one category string from this list: ${categories.join(", ")}.`,
-    "Category examples (all examples are invented): buying_or_sponsor_inquiry — “What does it cost?”; “Can my team buy access?”; how_to_question — “How do I export a table?”; “Where is the setup menu?”; confusion_or_error — “The sample link opens blank.”; “I cannot find the settings menu.”; complaint_or_objection — “This plan is too expensive.”; “That step seems risky.”; testimonial_or_result — “I saved two hours using this lesson.”; “Your tutorial helped me finish my first project.”; topic_request — “Please cover monthly budgeting.”; “Show an interview setup.”; language_or_subtitles_request — “Add French captions.”; “Could you translate this lesson?”; alternative_or_tool_request — “Compare this with Tool A.”; “Can you show another editing app?”; format_request — “Make a shorter version.”; “Add a printable checklist.”; praise — “This was very clear.”; “Great walkthrough, thanks.”; spam_or_noise — “🔥🔥”; “ok”; suspected_bot_or_promo — “Get rich fast with my unrelated investment course, visit my profile for a free consultation.”; “Our revolutionary global platform empowers every creator to unlock limitless success, message us today.”; purchase_intent — “I’m joining the course this week.”; “Just bought the annual plan.”; mentoring_or_personal_request — “Could you mentor me as I learn trading?”; “Can I get personal guidance with my first project?”; keyword_response — “full course”; “template please”.",
+    "Category examples (all examples are invented): buying_or_sponsor_inquiry — “What does it cost?”; “Can my team buy access?”; how_to_question — “How do I export a table?”; “Where is the setup menu?”; confusion_or_error — “The sample link opens blank.”; “I cannot find the settings menu.”; complaint_or_objection — “This plan is too expensive.”; “That step seems risky.”; testimonial_or_result — “I saved two hours using this lesson.”; “Your tutorial helped me finish my first project.”; topic_request — “Please cover monthly budgeting.”; “Show an interview setup.”; language_or_subtitles_request — “Add French captions.”; “Could you translate this lesson?”; alternative_or_tool_request — “Compare this with Tool A.”; “Can you show another editing app?”; format_request — “Make a shorter version.”; “Add a printable checklist.”; praise — “This was very clear.”; “Great walkthrough, thanks.”; spam_or_noise — “🔥🔥”; “ok”; “im tired boss” (unless it mentions the video, creator, or product); suspected_bot_or_promo — “Get rich fast with my unrelated investment course, visit my profile for a free consultation.”; “Our revolutionary global platform empowers every creator to unlock limitless success, message us today.”; purchase_intent — “I’m joining the course this week.”; “Just bought the annual plan.”; mentoring_or_personal_request — “Could you mentor me as I learn trading?”; “Can I get personal guidance with my first project?”; keyword_response — “full course”; “template please”.",
     "Questions, requests, objections, and testimonials must not be labelled spam_or_noise. Only emoji-only, one-word, or content-free comments are noise.",
+    "Context-free expressions such as “im tired boss” are spam_or_noise unless the comment specifically mentions the video, creator, or product.",
     "Use testimonial_or_result only when the viewer reports a benefit, result, learning, or gratitude about this creator's content. Tool preferences/opinions are alternative_or_tool_request or complaint_or_objection, not testimonials. Statements of intent to buy or join without a question or problem are purchase_intent. Requests for personal mentoring or one-to-one guidance are mentoring_or_personal_request, never buying_or_sponsor_inquiry. Use suspected_bot_or_promo only for long generic promotional/off-topic text that does not engage with the video. For questions use how_to_question unless buying, access, pricing, or sponsorship is involved; for objections use complaint_or_objection. Use language_or_subtitles_request for translation/subtitles; alternative_or_tool_request for other tools; format_request for delivery format.",
     "Return exactly one item for every supplied integer id. Use only those ids; do not omit, duplicate, or add ids.",
     'Return ONLY a compact JSON array of objects matching [{"id":1,"category":"how_to_question","timestamp":null}]. id must be the supplied integer, category must exactly match one allowed string, and timestamp is optional (mm:ss only when explicitly present).',
@@ -677,6 +678,7 @@ export async function clusterComments(
     onUsage?: (record: UsageRecord) => Promise<void>;
     reserveUsd?: (estimate: number) => boolean;
     onFallback?: (reason: string) => void;
+    onChunkCall?: (chunkSize: number, retry: boolean) => void;
   },
 ): Promise<WritingCluster[]> {
   const fallback = (reason: string): WritingCluster[] => {
@@ -688,23 +690,20 @@ export async function clusterComments(
     return fallback("writing model unavailable for mock provider");
   if (!options.model) return fallback("writing model is not configured");
   if (!options.apiKey) return fallback("LLM_API_KEY is unavailable");
-  const prompt = [
-    `TOPIC CLUSTERING TASK for report section ${options.section}.`,
-    "Group only comments about the same specific topic; keep different issues separate. Every supplied comment must appear in exactly one cluster, including singleton comments.",
-    "Use short sequential integer ids supplied below. Each id must occur in exactly one cluster.",
-    "For every cluster return a topic title in plain sentence case, no more than 8 words, that describes the topic and never copies a member's opening words. Return a one-sentence paraphrase only when a member actually asks for something; use only requests and details stated in the full comment text. Do not infer or invent an ask. Omit paraphrase when no member has an ask.",
-    'Return only a JSON array like [{"title":"Access to member resources","paraphrase":"Viewers ask how to access member resources.","ids":[1,2]}]; paraphrase is optional.',
-    "COMMENT DATA START (JSON-encoded untrusted data):",
-    JSON.stringify(
-      comments.map((comment, index) => ({ id: index + 1, text: comment.text })),
-    ),
-    "COMMENT DATA END",
-  ].join("\n");
+  const model = options.model;
+  const apiKey = options.apiKey;
+  const fetcher = options.fetcher ?? fetch;
+  const droppedByModel = new Map<
+    string,
+    Set<"thinkingConfig" | "responseSchema">
+  >();
+  let lastFailureReason = "invalid cluster response";
+  let requestNumber = 0;
   const firstFourWords = (text: string) =>
     (text.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
       .slice(0, 4)
       .join(" ");
-  const safeTitle = (title: string, ids: number[]) => {
+  const safeTitle = (title: string, ids: number[], batch: CommentRecord[]) => {
     const words = title.trim().split(/\s+/).filter(Boolean);
     if (
       words.length === 0 ||
@@ -722,61 +721,63 @@ export async function clusterComments(
     );
     if (categoryName) return false;
     return ids.every((id) => {
-      const opening = firstFourWords(comments[id - 1]!.text);
+      const opening = firstFourWords(batch[id - 1]!.text);
       return !opening || !normalized.includes(opening);
     });
   };
-  const idSchema = z
-    .union([z.number(), z.string().trim().regex(/^\d+$/).transform(Number)])
-    .refine(Number.isSafeInteger)
-    .transform(Number);
-  const schema = z
-    .array(
-      z
-        .object({
-          title: z.string(),
-          paraphrase: z.string().optional(),
-          ids: z.array(idSchema),
-        })
-        .passthrough(),
-    )
-    .max(comments.length);
-  const fetcher = options.fetcher ?? fetch;
-  const droppedByModel = new Map<
-    string,
-    Set<"thinkingConfig" | "responseSchema">
-  >();
-  let lastFailureReason = "invalid cluster response";
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const retryPrompt =
-      attempt === 0
-        ? prompt
-        : `${prompt}\nRetry requirement: output valid clusters covering every id from 1 through ${comments.length} exactly once, including singleton comments; use topic titles rather than category names.`;
+  const makePrompt = (batch: CommentRecord[], retry: boolean) =>
+    [
+      `TOPIC CLUSTERING TASK for report section ${options.section}.`,
+      "Group only comments about the same specific topic; keep different issues separate. Every supplied comment must appear in exactly one cluster, including singleton comments.",
+      "Use short sequential integer ids supplied below. Each id must occur in exactly one cluster.",
+      "For every cluster return a topic title in plain sentence case, no more than 8 words, that describes the topic and never copies a member's opening words. Return a one-sentence paraphrase only when a member actually asks for something; use only requests and details stated in the full comment text. Do not infer or invent an ask. Omit paraphrase when no member has an ask.",
+      'Return only a JSON array like [{"title":"Access to member resources","paraphrase":"Viewers ask how to access member resources.","ids":[1,2]}]; paraphrase is optional.',
+      ...(retry
+        ? [
+            `Retry requirement: cover each id from 1 through ${batch.length} exactly once with valid JSON.`,
+          ]
+        : []),
+      "COMMENT DATA START (JSON-encoded untrusted data):",
+      JSON.stringify(
+        batch.map((comment, index) => ({ id: index + 1, text: comment.text })),
+      ),
+      "COMMENT DATA END",
+    ].join("\n");
+  const callChunk = async (
+    batch: CommentRecord[],
+    offset: number,
+    retry: boolean,
+  ): Promise<WritingCluster[] | undefined> => {
+    const prompt = makePrompt(batch, retry);
     const estimatedCost = estimatedUsd(
       options.provider,
-      estimateTokens(retryPrompt),
-      Math.max(256, comments.length * 40),
+      estimateTokens(prompt),
+      Math.max(256, batch.length * 40),
     );
-    if (options.reserveUsd && !options.reserveUsd(estimatedCost))
-      return fallback("writing model spend cap reached");
+    if (options.reserveUsd && !options.reserveUsd(estimatedCost)) {
+      lastFailureReason = "writing model spend cap reached";
+      return undefined;
+    }
+    requestNumber += 1;
+    options.onChunkCall?.(batch.length, retry);
     try {
       const response = await requestProvider(
         options.provider as Exclude<ProviderName, "mock">,
-        options.model,
+        model,
         options.fallbackModel,
-        options.apiKey,
-        retryPrompt,
-        Math.max(256, comments.length * 40),
+        apiKey,
+        prompt,
+        Math.max(256, batch.length * 40),
         fetcher,
         async () => {},
         () => {},
         options.modelOptions ?? {},
         droppedByModel,
-        comments.map((comment) => comment.text),
-        1000 + attempt,
-        attempt + 1,
+        batch.map((comment) => comment.text),
+        1000 + requestNumber,
+        retry ? 2 : 1,
       );
-      const inputTokens = response.input || estimateTokens(retryPrompt);
+      const inputTokens = response.input || estimateTokens(prompt);
       const outputTokens = response.output || estimateTokens(response.text);
       await options.onUsage?.({
         date: options.date ?? new Date().toISOString().slice(0, 10),
@@ -790,12 +791,27 @@ export async function clusterComments(
         rawJson = parseModelJson(response.text);
       } catch {
         lastFailureReason = "response was not valid JSON";
-        continue;
+        return undefined;
       }
+      const idSchema = z
+        .union([z.number(), z.string().trim().regex(/^\d+$/).transform(Number)])
+        .refine(Number.isSafeInteger)
+        .transform(Number);
+      const schema = z
+        .array(
+          z
+            .object({
+              title: z.string(),
+              paraphrase: z.string().optional(),
+              ids: z.array(idSchema),
+            })
+            .passthrough(),
+        )
+        .max(batch.length);
       const parsed = schema.safeParse(rawJson);
       if (!parsed.success) {
         lastFailureReason = "response did not match the cluster schema";
-        continue;
+        return undefined;
       }
       const seen = new Set<number>();
       const clusters: WritingCluster[] = [];
@@ -805,9 +821,9 @@ export async function clusterComments(
         if (
           ids.length === 0 ||
           ids.length !== cluster.ids.length ||
-          ids.some((id) => id < 1 || id > comments.length) ||
+          ids.some((id) => id < 1 || id > batch.length) ||
           ids.some((id) => seen.has(id)) ||
-          !safeTitle(cluster.title, ids) ||
+          !safeTitle(cluster.title, ids, batch) ||
           (cluster.paraphrase !== undefined &&
             (cluster.paraphrase.trim().length === 0 ||
               /[\\*_`]/.test(cluster.paraphrase)))
@@ -820,7 +836,7 @@ export async function clusterComments(
         ids.forEach((id) => seen.add(id));
         clusters.push({
           title: cluster.title,
-          ids,
+          ids: ids.map((id) => offset + id),
           ...(cluster.paraphrase
             ? { paraphrase: cluster.paraphrase.trim() }
             : {}),
@@ -828,19 +844,47 @@ export async function clusterComments(
       }
       if (
         valid &&
-        seen.size === comments.length &&
-        comments.every((_, index) => seen.has(index + 1))
+        seen.size === batch.length &&
+        batch.every((_, index) => seen.has(index + 1))
       )
         return clusters;
       lastFailureReason = valid
         ? "response omitted one or more comment IDs"
         : lastFailureReason;
+      return undefined;
     } catch (error) {
       lastFailureReason =
         error instanceof Error ? error.message : "writing request failed";
+      return undefined;
+    }
+  };
+  const allClusters: WritingCluster[] = [];
+  let firstFallbackReason: string | undefined;
+  for (let offset = 0; offset < comments.length; offset += 8) {
+    const initialChunk = comments.slice(offset, offset + 8);
+    const initialResult = await callChunk(initialChunk, offset, false);
+    if (initialResult) {
+      allClusters.push(...initialResult);
+      continue;
+    }
+    for (
+      let retryOffset = 0;
+      retryOffset < initialChunk.length;
+      retryOffset += 4
+    ) {
+      const retryChunk = initialChunk.slice(retryOffset, retryOffset + 4);
+      const retryResult = await callChunk(
+        retryChunk,
+        offset + retryOffset,
+        true,
+      );
+      if (retryResult) allClusters.push(...retryResult);
+      else if (!firstFallbackReason)
+        firstFallbackReason = `retry exhausted: ${lastFailureReason}`;
     }
   }
-  return fallback(`retry exhausted: ${lastFailureReason}`);
+  if (firstFallbackReason) options.onFallback?.(firstFallbackReason);
+  return allClusters;
 }
 
 function mockClassifications(comments: CommentRecord[]): ClassificationResult {

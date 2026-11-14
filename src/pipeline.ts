@@ -86,6 +86,11 @@ export interface RunStats {
   titleFallbacks: Partial<
     Record<ReportSection, { count: number; reason: string }>
   >;
+  clustering: {
+    calls: number;
+    retryCalls: number;
+    chunkSizes: number[];
+  };
   droppedQuotes: {
     emptyQuote: number;
     quoteNotFound: number;
@@ -261,6 +266,11 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
         praise: 0,
       },
       titleFallbacks: {},
+      clustering: {
+        calls: 0,
+        retryCalls: 0,
+        chunkSizes: [],
+      },
       droppedQuotes: {
         emptyQuote: 0,
         quoteNotFound: 0,
@@ -464,6 +474,11 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
         }
       : {}),
   };
+  const clustering: RunStats["clustering"] = {
+    calls: 0,
+    retryCalls: 0,
+    chunkSizes: [],
+  };
   let reportClusters: ReportClusters = {};
   if (!options.classifyOnly && options.config.provider !== "mock") {
     const usageRows = await readUsage(options.usagePath);
@@ -489,6 +504,16 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
       now,
       (record) => appendUsage(record, options.usagePath),
       reserveUsd,
+      undefined,
+      (section, chunkSize, retry) => {
+        clustering.calls += 1;
+        clustering.chunkSizes.push(chunkSize);
+        if (retry) clustering.retryCalls += 1;
+        if (options.debug)
+          console.log(
+            `Writing cluster call: section=${section}, comments=${chunkSize}, retry=${retry}.`,
+          );
+      },
     );
   }
   const rendered = renderReport(reportInput, reportClusters);
@@ -556,6 +581,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     reportItemsBySection: rendered.sectionItemCounts,
     reportDestinationCounts: rendered.reportDestinationCounts,
     titleFallbacks: rendered.titleFallbacks,
+    clustering,
     droppedQuotes: rendered.droppedQuotes,
   };
   await writeFile(
