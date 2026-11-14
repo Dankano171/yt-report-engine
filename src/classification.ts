@@ -1,11 +1,4 @@
-const lowInformationPhrases = new Set([
-  "thanks",
-  "thank you",
-  "thx",
-  "ty",
-  "full course",
-  "fullcourse",
-]);
+const lowInformationPhrases = new Set(["thanks", "thx", "ty"]);
 
 export function isLowInformationComment(text: string): boolean {
   const normalized = text

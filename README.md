@@ -30,7 +30,7 @@ A read-only YouTube audience intelligence CLI. It reads public comments on recen
 pnpm start -- run --channel @examplecreator --days 30
 ```
 
-The default is always a dry run: it writes `output/<channel>/<date>/report.html`, `report.md`, and `stats.json` and does not send email. The run prints progress and a summary of fetched/analyzed data, classifications, report items, and quote verification. Use `--debug` to log sanitized per-response counts, short returned indexes, Gemini finish/token metadata, rejected optional fields, and provider error details without printing comment text. `--classify-only` classifies only the first batch, prints the same diagnostics, saves `stats.json`, and skips the report.
+The default is always a dry run: it writes `output/<channel>/<date>/report.html`, `report.md`, and `stats.json` and does not send email. The run prints progress and a summary of fetched/analyzed data, classifications, report items, and quote verification. Use `--debug` to log sanitized per-response counts, short returned indexes, text-length metrics, Gemini finish/token metadata, rejected optional fields, and provider error details without printing comment text. `--dump-prompt` writes the exact prompt and raw provider response body for each batch under `output/<channel>/<date>/debug/`; these files are created with private permissions, never contain request headers or URLs, redact API keys, and are removed by `purge` after 30 days. `--classify-only` classifies only the first batch, prints the same diagnostics, saves `stats.json`, and skips the report.
 
 To explicitly run and send the report to the configured opt-in recipients:
 
@@ -49,7 +49,7 @@ Use your own address as the only recipient for a test email. Sending requires bo
 ## Other commands
 
 ```sh
-pnpm start -- purge   # Permanently remove cached comment text older than 30 days
+pnpm start -- purge   # Permanently remove cached comments and debug dumps older than 30 days
 pnpm start -- cost    # Show today's recorded quota/token/cost estimates
 pnpm check:secrets    # Scan tracked working files for common API-key shapes
 ```
@@ -60,7 +60,7 @@ The scanner is a best-effort guard, not a substitute for keeping secrets out of 
 
 `provider` may be `gemini`, `anthropic`, `openai`, or `mock` (the mock provider is for tests and local development only). Set `model` to a model available for the selected provider; `fallbackModel` is optional and is used after four 429/503 retries on the primary model. Optional Gemini request settings can be set per model under `modelOptions`, for example `"modelOptions": {"gemini-2.5-flash": {"thinkingBudget": 0, "maxOutputTokens": 1024}}`. Supported settings are `responseMimeType`, `responseSchema`, `thinkingBudget` (sent as `thinkingConfig.thinkingBudget`), and `maxOutputTokens`. By default the request uses JSON MIME output and a conservative output-token budget, without a response schema or thinking config. If a model rejects `thinkingConfig` or `responseSchema` as an unsupported field, that field is dropped for subsequent requests to that model during the run. Each channel needs exactly one of `handle` or `channelId`, a `creatorName`, `creatorGoal` (`sell_course`, `sell_tool`, `sponsorships`, or `grow_audience`), and a non-empty `recipients` list. Optional `productKeywords` help classify relevant inquiries. `limits` controls videos (default 8), comment threads per video (default 300), estimated LLM spend per run/day (defaults $0.50/$2.00), and output budget (default 60 tokens per comment plus 256 tokens overhead; configurable with `maxOutputTokensPerComment` and `outputTokenOverhead`). Adjust these caps to suit the account and provider. YouTube quota units and model token/cost figures are estimates; provider pricing and quota rules can change. Run `cost` to see locally recorded usage for the current UTC day.
 
-The program batches comments and checks the estimate against the configured spend caps before each LLM call. It retries transient network/server failures with backoff and stops without retrying quota exhaustion. The model receives sequential integer indexes instead of YouTube comment IDs, and returns category/timestamp only. Categories are normalized and known synonyms are mapped; unknown categories are retried once with the allowed list. Quotes always come from fetched comment text in code (trimmed and capped at 300 characters), never from model output. Output is validated in code; valid items are kept, missing, invalid, or unmapped items are retried once using new short indexes, and Gemini output truncated at `MAX_TOKENS` is retried in smaller batches. Any remaining comments are counted as unclassified in `stats.json` and excluded from findings; a run stops without a report only when more than 30% of analyzed comments are unclassified. Comment text is cached only as needed and cache files older than 30 days can be removed with `purge`; the retention rule applies to cached raw comment text, not reports you choose to keep.
+The program batches comments and checks the estimate against the configured spend caps before each LLM call. It retries transient network/server failures with backoff and stops without retrying quota exhaustion. The model receives sequential integer indexes instead of YouTube comment IDs, and returns category/timestamp only. Categories are normalized and known synonyms are mapped; unknown categories are retried once with the allowed list. Quotes always come from fetched comment text in code (trimmed and capped at 300 characters), never from model output. Output is validated in code; valid items are kept, missing, invalid, or unmapped items are retried once using new short indexes, and Gemini output truncated at `MAX_TOKENS` is retried in smaller batches. Any remaining comments are counted as unclassified in `stats.json` and excluded from findings; a run stops without a report only when more than 30% of analyzed comments are unclassified. Comment text is cached only as needed. `purge` removes cache files and prompt/response dumps older than 30 days, but leaves reports and usage records untouched.
 
 ## How to read the report
 
@@ -71,7 +71,7 @@ The program batches comments and checks the estimate against the configured spen
 - **Proof pack:** selected viewer testimonials/results. Ordering is tailored to the creator goal.
 - **Already answered: pin these:** repeated or high-like questions that have a creator reply, with the fetched reply link when available and a suggestion to pin it or add it to the video description FAQ.
 
-Emoji-only and low-information comments such as “Full course” and “thanks” are classified as noise and counted, but never shown as findings. “How to read this” notes that the analysis is AI-generated. Counts and links come from fetched data; quotes are kept only when they match the fetched source comment after Unicode, whitespace, and HTML-entity normalization.
+Emoji-only, one-word, and content-free comments are classified as noise and counted, but never shown as findings. “How to read this” notes that the analysis is AI-generated. Counts and links come from fetched data; quotes are kept only when they match the fetched source comment after Unicode, whitespace, and HTML-entity normalization.
 
 ## Troubleshooting
 
@@ -89,7 +89,7 @@ Emoji-only and low-information comments such as “Full course” and “thanks�
 - `emailFrom` is global configuration because Resend requires a sender identity. Configure a verified sender before using `--send`.
 - “High-like” means at least 5 likes, a fixed implementation threshold rather than a model-generated score. It is not a health rating.
 - Provider prices are rough estimates, not billing guarantees. The tool uses recent public data only and cannot see private, held-for-review, or deleted comments.
-- Reports are left on disk until you remove them; `purge` deletes only the raw-comment cache, not reports or usage records.
+- Reports are left on disk until you remove them; `purge` removes old raw-comment cache and debug dumps, not reports or usage records.
 
 ## LIMITATIONS
 

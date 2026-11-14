@@ -11,7 +11,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { analyzeComments, buildClassificationPrompt } from "../src/llm.js";
 import { renderReport } from "../src/report.js";
-import { purgeOldCache } from "../src/storage.js";
+import { isLowInformationComment } from "../src/classification.js";
+import { purgeOldCache, purgeOldDebugDumps } from "../src/storage.js";
 import type {
   ChannelConfig,
   CommentRecord,
@@ -64,6 +65,13 @@ function openAiResponse(content: string): Response {
 }
 
 describe("comment analysis safety", () => {
+  it("does not preclassify meaningful multi-word comments as noise", () => {
+    expect(isLowInformationComment("Full course")).toBe(false);
+    expect(isLowInformationComment("Thank you")).toBe(false);
+    expect(isLowInformationComment("thanks")).toBe(true);
+    expect(isLowInformationComment("🔥🔥")).toBe(true);
+  });
+
   it("clearly delimits untrusted comments and instructs the model to ignore embedded instructions", () => {
     const prompt = buildClassificationPrompt([comment]);
     expect(prompt).toContain("COMMENT DATA START");
@@ -81,6 +89,118 @@ describe("comment analysis safety", () => {
     expect(prompt).toContain("What does it cost?");
     expect(prompt).toContain("Can my team buy access?");
     expect(prompt).toContain("COMMENT DATA END");
+  });
+
+  it("includes every supplied comment and reports empty text without logging it", async () => {
+    const emptyTextComment = { ...comment, commentId: "empty", text: "" };
+    const events: {
+      nonEmptyTextCount?: number;
+      averageTextLength?: number;
+      minimumTextLength?: number;
+    }[] = [];
+    let prompt = "";
+    const result = await analyzeComments([emptyTextComment, comment], {
+      provider: "openai",
+      model: "test-model",
+      apiKey: "test-key",
+      batchSize: 2,
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async (_input, init) => {
+        prompt =
+          (
+            JSON.parse(String(init?.body)) as {
+              messages: { content: string }[];
+            }
+          ).messages[0]?.content ?? "";
+        return openAiResponse(
+          JSON.stringify([
+            { id: 1, category: "question" },
+            { id: 2, category: "question" },
+          ]),
+        );
+      },
+      onBatchEvent: (event) => events.push(event),
+    });
+    expect(prompt).toContain('"text":""');
+    expect(prompt).toContain(comment.text);
+    expect(result.classifications.map((item) => item.commentId)).toEqual([
+      "empty",
+      "c1",
+    ]);
+    expect(events[0]).toMatchObject({
+      nonEmptyTextCount: 1,
+      minimumTextLength: 0,
+    });
+    expect(events[0]?.averageTextLength).toBeGreaterThan(0);
+  });
+
+  it("retries a suspicious all-noise batch with the fallback model", async () => {
+    const comments = Array.from({ length: 10 }, (_, index) => ({
+      ...comment,
+      commentId: `question-${index}`,
+      text: `How do I configure feature ${index}?`,
+    }));
+    const models: string[] = [];
+    const result = await analyzeComments(comments, {
+      provider: "openai",
+      model: "primary",
+      fallbackModel: "fallback",
+      apiKey: "test-key",
+      batchSize: 10,
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as { model: string };
+        models.push(request.model);
+        const category =
+          request.model === "primary" ? "spam_or_noise" : "how_to_question";
+        const content = JSON.stringify(
+          comments.map((_, index) => ({ id: index + 1, category })),
+        );
+        return openAiResponse(content);
+      },
+    });
+    expect(models).toEqual(["primary", "fallback"]);
+    expect(result.classifications).toHaveLength(10);
+    expect(
+      result.classifications.every(
+        (item) => item.category === "how_to_question",
+      ),
+    ).toBe(true);
+    expect(result.suspiciousAllNoise).toBe(false);
+    expect(result.classificationSucceeded).toBe(true);
+  });
+
+  it("marks the run incomplete when the fallback also returns all noise", async () => {
+    const comments = Array.from({ length: 10 }, (_, index) => ({
+      ...comment,
+      commentId: `question-${index}`,
+      text: `How do I configure feature ${index}?`,
+    }));
+    const result = await analyzeComments(comments, {
+      provider: "openai",
+      model: "primary",
+      fallbackModel: "fallback",
+      apiKey: "test-key",
+      batchSize: 10,
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async () =>
+        openAiResponse(
+          JSON.stringify(
+            comments.map((_, index) => ({
+              id: index + 1,
+              category: "spam_or_noise",
+            })),
+          ),
+        ),
+    });
+    expect(result.suspiciousAllNoise).toBe(true);
+    expect(result.classificationSucceeded).toBe(false);
   });
 
   it("stops before calling the provider when the spend cap is exceeded", async () => {
@@ -894,5 +1014,28 @@ describe("raw comment cache retention", () => {
     await expect(readFile(newFile, "utf8")).resolves.toContain(
       "new private comment",
     );
+  });
+});
+
+describe("debug dump retention", () => {
+  it("deletes only prompt/response dumps older than 30 days", async () => {
+    const root = join(await getTempRoot(), "output");
+    const debugFolder = join(root, "@creator", "2026-01-01", "debug");
+    await mkdir(debugFolder, { recursive: true });
+    const oldDump = join(debugFolder, "batch-1-prompt.txt");
+    const recentDump = join(debugFolder, "batch-2-response.txt");
+    const unrelated = join(debugFolder, "notes.txt");
+    await Promise.all([
+      writeFile(oldDump, "old"),
+      writeFile(recentDump, "recent"),
+      writeFile(unrelated, "keep"),
+    ]);
+    const now = new Date("2026-03-15T00:00:00Z");
+    const oldDate = new Date(now.getTime() - 31 * 86_400_000);
+    await utimes(oldDump, oldDate, oldDate);
+    expect(await purgeOldDebugDumps(root, now)).toBe(1);
+    await expect(readFile(oldDump)).rejects.toThrow();
+    await expect(readFile(recentDump, "utf8")).resolves.toBe("recent");
+    await expect(readFile(unrelated, "utf8")).resolves.toBe("keep");
   });
 });

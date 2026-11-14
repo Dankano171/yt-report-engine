@@ -108,4 +108,47 @@ describe("YouTube data", () => {
       "https://www.youtube.com/watch?v=video1&lc=comment1.reply1",
     );
   });
+
+  it("requests plain text and decodes the textDisplay fallback", async () => {
+    const requestedUrls: URL[] = [];
+    const baseFetch = fakeYouTubeFetch();
+    const fetcher: Fetcher = async (input, init) => {
+      const url = new URL(String(input));
+      requestedUrls.push(url);
+      const response = await baseFetch(input, init);
+      const payload = (await response.json()) as {
+        items?: {
+          snippet?: { totalReplyCount?: number };
+          topLevelComment?: { snippet?: Record<string, unknown> };
+        }[];
+      };
+      const thread = payload.items?.[0];
+      const snippet = thread?.topLevelComment?.snippet;
+      if (snippet) {
+        delete snippet.textOriginal;
+        snippet.textDisplay = "<b>How</b> &amp; where?";
+        if (thread) thread.snippet = { totalReplyCount: 2 };
+      }
+      return new Response(JSON.stringify(payload), { status: 200 });
+    };
+    const result = await fetchChannelData({
+      apiKey: "test-key",
+      handleOrId: "@creator",
+      days: 30,
+      maxVideos: 8,
+      maxThreadsPerVideo: 300,
+      now,
+      fetcher,
+      wait: async () => {},
+    });
+    expect(result.comments[0]?.text).toBe("How & where?");
+    expect(
+      requestedUrls
+        .filter((url) => /\/(?:commentThreads|comments)$/.test(url.pathname))
+        .every((url) => url.searchParams.get("textFormat") === "plainText"),
+    ).toBe(true);
+    expect(
+      requestedUrls.some((url) => url.pathname.endsWith("/comments")),
+    ).toBe(true);
+  });
 });

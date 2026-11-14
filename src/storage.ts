@@ -50,6 +50,46 @@ export async function purgeOldCache(
   return deleted;
 }
 
+export async function purgeOldDebugDumps(
+  root = "output",
+  now = new Date(),
+): Promise<number> {
+  let channels: string[];
+  try {
+    channels = await readdir(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  const expiry = now.getTime() - 30 * 86_400_000;
+  let deleted = 0;
+  for (const channel of channels) {
+    const channelPath = join(root, channel);
+    if (!(await stat(channelPath)).isDirectory()) continue;
+    const dates = await readdir(channelPath);
+    for (const date of dates) {
+      const debugPath = join(channelPath, date, "debug");
+      let entries: string[];
+      try {
+        entries = await readdir(debugPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      for (const entry of entries) {
+        if (!/^batch-\d+-(?:prompt|response)\.txt$/.test(entry)) continue;
+        const path = join(debugPath, entry);
+        const info = await stat(path);
+        if (info.isFile() && info.mtimeMs < expiry) {
+          await unlink(path);
+          deleted += 1;
+        }
+      }
+    }
+  }
+  return deleted;
+}
+
 export async function readUsage(
   path = "usage_logs/usage.jsonl",
 ): Promise<UsageRecord[]> {

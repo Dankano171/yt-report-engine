@@ -4,7 +4,7 @@ import { loadConfig, matchChannel } from "./config.js";
 import { sendExistingReport } from "./email.js";
 import { QuotaError, redactSecrets } from "./errors.js";
 import { runChannel } from "./pipeline.js";
-import { purgeOldCache, readUsage } from "./storage.js";
+import { purgeOldCache, purgeOldDebugDumps, readUsage } from "./storage.js";
 
 const program = new Command();
 program
@@ -25,6 +25,7 @@ program
   .option("--dry-run", "Write report only (default; no email is sent)")
   .option("--send", "Send the report to configured recipients")
   .option("--debug", "Log sanitized LLM batch outcomes")
+  .option("--dump-prompt", "Save LLM prompts and raw responses under output/")
   .option(
     "--classify-only",
     "Classify the first batch only; do not write a report",
@@ -37,6 +38,7 @@ program
       send?: boolean;
       debug?: boolean;
       classifyOnly?: boolean;
+      dumpPrompt?: boolean;
     }) => {
       if (options.send && options.dryRun)
         throw new Error("Choose either --send or --dry-run, not both.");
@@ -49,8 +51,12 @@ program
         config,
         days: Number(options.days),
         send: options.send === true,
-        debug: options.debug === true || options.classifyOnly === true,
+        debug:
+          options.debug === true ||
+          options.classifyOnly === true ||
+          options.dumpPrompt === true,
         classifyOnly: options.classifyOnly === true,
+        dumpPrompt: options.dumpPrompt === true,
       });
       if (result.classifyOnly) {
         console.log(
@@ -84,12 +90,10 @@ program
 
 program
   .command("purge")
-  .description("Delete cached raw comments older than 30 days")
+  .description("Delete cached comments and debug dumps older than 30 days")
   .action(async () => {
-    const deleted = await purgeOldCache();
-    console.log(
-      `Purged ${deleted} expired cache file${deleted === 1 ? "" : "s"}.`,
-    );
+    const deleted = (await purgeOldCache()) + (await purgeOldDebugDumps());
+    console.log(`Purged ${deleted} expired file${deleted === 1 ? "" : "s"}.`);
   });
 
 program

@@ -1,10 +1,11 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { sendEmail } from "./email.js";
 import { analyzeComments, type FailedBatch } from "./llm.js";
 import { renderReport } from "./report.js";
 import { appendUsage, cacheComments } from "./storage.js";
 import { fetchChannelData } from "./youtube.js";
+import { redactSecrets } from "./errors.js";
 import type {
   AppConfig,
   Category,
@@ -27,6 +28,7 @@ export interface RunOptions {
   sendEmailFn?: typeof sendEmail;
   debug?: boolean;
   classifyOnly?: boolean;
+  dumpPrompt?: boolean;
 }
 
 export interface RunStats {
@@ -35,6 +37,7 @@ export interface RunStats {
   commentsFetched: number;
   commentsSentToLlm: number;
   unclassified: number;
+  suspiciousAllNoise: boolean;
   classificationSucceeded: boolean;
   failureReason?: string;
   classifyOnly?: boolean;
@@ -113,6 +116,25 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   const analysisComments = options.classifyOnly
     ? data.comments.slice(0, 20)
     : data.comments;
+  const folder = resolve(
+    options.outputRoot ?? "output",
+    channelKey(options.channel),
+    now.toISOString().slice(0, 10),
+  );
+  const debugFolder = resolve(folder, "debug");
+  if (options.dumpPrompt) await mkdir(debugFolder, { recursive: true });
+  const dumpedBatches = new Set<number>();
+  const sanitizeDump = (text: string): string => {
+    let sanitized = redactSecrets(text);
+    for (const key of [
+      process.env.LLM_API_KEY,
+      process.env.YOUTUBE_API_KEY,
+      process.env.RESEND_API_KEY,
+    ]) {
+      if (key) sanitized = sanitized.replaceAll(key, "[REDACTED]");
+    }
+    return sanitized;
+  };
   const analysis = await analyzeComments(analysisComments, {
     provider: options.config.provider,
     ...(options.config.model ? { model: options.config.model } : {}),
@@ -139,7 +161,53 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     ...(options.fetcher ? { fetcher: options.fetcher } : {}),
     ...(options.wait ? { wait: options.wait } : {}),
     onProgress: (message) => console.log(message),
-    ...(options.debug || options.classifyOnly
+    ...(options.dumpPrompt
+      ? {
+          onProviderExchange: async ({
+            batch,
+            attempt,
+            prompt,
+            systemInstruction,
+            rawResponse,
+          }: {
+            batch: number;
+            attempt: number;
+            prompt: string;
+            systemInstruction?: string;
+            rawResponse: string;
+          }) => {
+            const promptPath = resolve(
+              debugFolder,
+              `batch-${batch}-prompt.txt`,
+            );
+            const responsePath = resolve(
+              debugFolder,
+              `batch-${batch}-response.txt`,
+            );
+            const prefix = dumpedBatches.has(batch)
+              ? `\n\n===== attempt ${attempt} =====\n`
+              : `===== attempt ${attempt} =====\n`;
+            const promptText = systemInstruction
+              ? `SYSTEM INSTRUCTION\n${systemInstruction}\n\nUSER CONTENT\n${prompt}`
+              : prompt;
+            await appendFile(
+              promptPath,
+              `${prefix}${sanitizeDump(promptText)}\n`,
+              {
+                encoding: "utf8",
+                mode: 0o600,
+              },
+            );
+            await appendFile(
+              responsePath,
+              `${prefix}${sanitizeDump(rawResponse)}\n`,
+              { encoding: "utf8", mode: 0o600 },
+            );
+            dumpedBatches.add(batch);
+          },
+        }
+      : {}),
+    ...(options.debug || options.classifyOnly || options.dumpPrompt
       ? {
           onBatchEvent: (event) => {
             console.log(
@@ -157,6 +225,9 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
                 rawCategoryHistogram: event.rawCategoryHistogram ?? {},
                 mappedCategoryHistogram: event.mappedCategoryHistogram ?? {},
                 unmappedCount: event.unmappedCount ?? 0,
+                nonEmptyTextCount: event.nonEmptyTextCount ?? 0,
+                averageTextLength: event.averageTextLength ?? 0,
+                minimumTextLength: event.minimumTextLength ?? 0,
                 finishReason: event.finishReason ?? null,
                 promptFeedbackBlockReason:
                   event.promptFeedbackBlockReason ?? null,
@@ -186,6 +257,8 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
       : 0;
   const exceedsUnclassifiedThreshold = unclassifiedRatio > 0.3;
   const unclassifiedReason = `${analysis.unclassifiedCount} of ${analysisComments.length} analyzed comments remained unclassified after retry.`;
+  const suspiciousReason =
+    "A batch remained more than 90% spam_or_noise after fallback-model verification.";
   console.log("Verifying quotes.");
   const rendered = renderReport({
     channel: options.channel,
@@ -196,21 +269,19 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     classificationSucceeded: analysis.classificationSucceeded,
     ...(analysis.stoppedReason ||
     analysis.unclassifiedCount > 0 ||
+    analysis.suspiciousAllNoise ||
     analysis.failedBatches.length > 0
       ? {
           stoppedReason:
             analysis.stoppedReason ??
-            (analysis.unclassifiedCount > 0
-              ? unclassifiedReason
-              : `${analysis.failedBatches.length} classification batch(es) failed after retry; see stats.json.`),
+            (analysis.suspiciousAllNoise
+              ? suspiciousReason
+              : analysis.unclassifiedCount > 0
+                ? unclassifiedReason
+                : `${analysis.failedBatches.length} classification batch(es) failed after retry; see stats.json.`),
         }
       : {}),
   });
-  const folder = resolve(
-    options.outputRoot ?? "output",
-    channelKey(options.channel),
-    now.toISOString().slice(0, 10),
-  );
   await mkdir(folder, { recursive: true });
   const classificationsByCategory: Record<Category, number> = {
     buying_or_sponsor_inquiry: 0,
@@ -233,6 +304,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     commentsFetched: data.comments.length,
     commentsSentToLlm: analysis.commentsSentToLlm,
     unclassified: analysis.unclassifiedCount,
+    suspiciousAllNoise: analysis.suspiciousAllNoise,
     classificationSucceeded: analysis.classificationSucceeded,
     ...(exceedsUnclassifiedThreshold
       ? {
@@ -242,9 +314,14 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
         }
       : analysis.stoppedReason
         ? { stoppedReason: analysis.stoppedReason }
-        : analysis.unclassifiedCount > 0
-          ? { stoppedReason: unclassifiedReason }
-          : {}),
+        : analysis.suspiciousAllNoise
+          ? {
+              stoppedReason: suspiciousReason,
+              failureReason: "Suspicious all-noise classification persisted.",
+            }
+          : analysis.unclassifiedCount > 0
+            ? { stoppedReason: unclassifiedReason }
+            : {}),
     ...(options.classifyOnly ? { classifyOnly: true } : {}),
     batches: {
       total: analysis.batchCount,

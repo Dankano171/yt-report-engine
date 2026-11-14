@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -228,6 +228,141 @@ describe("run pipeline", () => {
     await expect(
       readFile(join(result.reportFolder, "report.md"), "utf8"),
     ).rejects.toThrow();
+  });
+
+  it("writes prompt and raw response dumps without credentials", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-prompt-dump-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-secret";
+    process.env.LLM_API_KEY = "test-llm-secret";
+    const youtubeFetcher = fetcher(1, ["How do I set this up?"]);
+    const geminiFetcher: Fetcher = async (input, init) => {
+      if (new URL(String(input)).hostname === "www.googleapis.com")
+        return youtubeFetcher(input, init);
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify([
+                      { id: 1, category: "how_to_question", timestamp: null },
+                    ]),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    };
+    const result = await runChannel({
+      channel,
+      config: { ...config, provider: "gemini", model: "test-model" },
+      days: 30,
+      send: false,
+      dumpPrompt: true,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: geminiFetcher,
+      wait: async () => {},
+    });
+    const debugFolder = join(result.reportFolder, "debug");
+    const prompt = await readFile(
+      join(debugFolder, "batch-1-prompt.txt"),
+      "utf8",
+    );
+    const response = await readFile(
+      join(debugFolder, "batch-1-response.txt"),
+      "utf8",
+    );
+    expect(prompt).toContain(
+      "SYSTEM INSTRUCTION\nClassify each supplied comment",
+    );
+    expect(prompt).toContain("USER CONTENT");
+    expect(prompt).toContain("How do I set this up?");
+    expect(response).toContain('\\"category\\":\\"how_to_question\\"');
+    expect(prompt).not.toContain("test-llm-secret");
+    expect(response).not.toContain("test-llm-secret");
+    expect(prompt).not.toContain("test-youtube-secret");
+    expect(prompt).not.toContain("generativelanguage.googleapis.com");
+    expect(
+      await stat(join(debugFolder, "batch-1-prompt.txt")).then(
+        (file) => file.mode & 0o777,
+      ),
+    ).toBe(0o600);
+  });
+
+  it("records suspicious all-noise batches and retries the fallback model", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-suspicious-noise-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-secret";
+    process.env.LLM_API_KEY = "test-llm-secret";
+    const models: string[] = [];
+    const youtubeFetcher = fetcher(10);
+    const fetcherWithNoise: Fetcher = async (input, init) => {
+      if (new URL(String(input)).hostname === "www.googleapis.com")
+        return youtubeFetcher(input, init);
+      const request = JSON.parse(String(init?.body)) as {
+        model: string;
+        messages: { content: string }[];
+      };
+      models.push(request.model);
+      const prompt = request.messages[0]?.content ?? "";
+      const start = prompt.indexOf("COMMENT DATA START");
+      const end = prompt.indexOf("COMMENT DATA END");
+      const jsonStart = prompt.indexOf("\n", start) + 1;
+      const items = JSON.parse(prompt.slice(jsonStart, end).trim()) as {
+        id: number;
+      }[];
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify(
+                  items.map(({ id }) => ({ id, category: "spam_or_noise" })),
+                ),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    };
+    const outputRoot = join(root, "output");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await runChannel({
+      channel,
+      config: {
+        ...config,
+        provider: "openai",
+        model: "primary-model",
+        fallbackModel: "fallback-model",
+      },
+      days: 30,
+      send: false,
+      outputRoot,
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: fetcherWithNoise,
+      wait: async () => {},
+    });
+    expect(models).toEqual(["primary-model", "fallback-model"]);
+    expect(result.stats.suspiciousAllNoise).toBe(true);
+    expect(result.stats.classificationSucceeded).toBe(false);
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringMatching(/suspicious.*spam_or_noise/i),
+    );
+    const stats = JSON.parse(
+      await readFile(join(result.reportFolder, "stats.json"), "utf8"),
+    ) as { suspiciousAllNoise: boolean };
+    expect(stats.suspiciousAllNoise).toBe(true);
   });
 
   it("writes a report when at most 30% of analyzed comments are unclassified", async () => {

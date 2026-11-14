@@ -39,6 +39,34 @@ function number(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function plainTextFromHtml(value: string): string {
+  const namedEntities: Record<string, string> = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: '"',
+  };
+  return value
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&(#(?:x[\da-f]+|\d+)|[a-z]+);/gi, (entity, value: string) => {
+      if (value.startsWith("#")) {
+        const hex = value[1]?.toLowerCase() === "x";
+        const codePoint = Number.parseInt(
+          value.slice(hex ? 2 : 1),
+          hex ? 16 : 10,
+        );
+        return Number.isFinite(codePoint) && codePoint <= 0x10ffff
+          ? String.fromCodePoint(codePoint)
+          : entity;
+      }
+      return namedEntities[value] ?? entity;
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function durationSeconds(duration: string): number {
   const match = duration.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/);
   if (!match) return 0;
@@ -116,10 +144,12 @@ function commentFrom(
 ): CommentRecord {
   const snippet = object(object(raw).snippet);
   const author = object(snippet.authorChannelId);
+  const textOriginal = string(snippet.textOriginal);
+  const textDisplay = string(snippet.textDisplay);
   return {
     commentId: string(object(raw).id),
     videoId,
-    text: string(snippet.textOriginal) || string(snippet.textDisplay),
+    text: textOriginal.trim() ? textOriginal : plainTextFromHtml(textDisplay),
     likeCount: number(snippet.likeCount),
     publishedAt: string(snippet.publishedAt),
     totalReplyCount,
@@ -241,6 +271,7 @@ export async function fetchChannelData(
       const params = {
         part: "snippet,replies",
         videoId: video.videoId,
+        textFormat: "plainText",
         maxResults: String(
           Math.min(100, options.maxThreadsPerVideo - threadsRead),
         ),
@@ -290,6 +321,7 @@ export async function fetchChannelData(
               {
                 part: "snippet",
                 parentId: string(object(thread.topLevelComment).id),
+                textFormat: "plainText",
                 maxResults: "100",
                 ...(replyToken ? { pageToken: replyToken } : {}),
               },

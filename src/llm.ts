@@ -26,6 +26,9 @@ const categories = [
   "spam_or_noise",
 ] as const satisfies readonly Category[];
 
+const geminiSystemInstruction =
+  "Classify each supplied comment according to the user's classification instructions. Return only the requested JSON.";
+
 const categoryAliases: Record<string, Category> = {
   question: "how_to_question",
   how_to: "how_to_question",
@@ -83,6 +86,13 @@ interface LlmOptions {
   onUsage?: (record: UsageRecord) => Promise<void>;
   onProgress?: (message: string) => void;
   onBatchEvent?: (event: BatchEvent) => void;
+  onProviderExchange?: (event: {
+    batch: number;
+    attempt: number;
+    prompt: string;
+    systemInstruction?: string;
+    rawResponse: string;
+  }) => Promise<void>;
   maxOutputTokensPerComment?: number;
   outputTokenOverhead?: number;
 }
@@ -122,6 +132,9 @@ export interface BatchEvent {
   rawCategoryHistogram?: Record<string, number>;
   mappedCategoryHistogram?: Partial<Record<Category, number>>;
   unmappedCount?: number;
+  nonEmptyTextCount?: number;
+  averageTextLength?: number;
+  minimumTextLength?: number;
 }
 
 export interface FailedBatch {
@@ -142,6 +155,7 @@ export interface AnalysisResult {
   failedBatches: FailedBatch[];
   commentsSentToLlm: number;
   unclassifiedCount: number;
+  suspiciousAllNoise: boolean;
   classificationSucceeded: boolean;
 }
 
@@ -178,7 +192,7 @@ export function buildClassificationPrompt(comments: CommentRecord[]): string {
   }));
   return [
     `Classify every comment using exactly one category string from this list: ${categories.join(", ")}.`,
-    "Category examples (all examples are invented): buying_or_sponsor_inquiry — “What does it cost?”; “Can my team buy access?”; how_to_question — “How do I export?”; “Where is setup?”; confusion_or_error — “The link opens blank.”; “I cannot find the menu.”; complaint_or_objection — “This is too expensive.”; “That step seems risky.”; testimonial_or_result — “I saved two hours.”; “My sales increased.”; topic_request — “Please cover budgeting.”; “Show an interview setup.”; language_or_subtitles_request — “Add French captions.”; “Could you translate this?”; alternative_or_tool_request — “Compare it with Tool A.”; “Can you show another app?”; format_request — “Make a short version.”; “Add a checklist.”; praise — “This was clear.”; “Great walkthrough.”; spam_or_noise — “🔥🔥”; “Thanks.”",
+    "Category examples (all examples are invented): buying_or_sponsor_inquiry — “What does it cost?”; “Can my team buy access?”; how_to_question — “How do I export?”; “Where is setup?”; confusion_or_error — “The link opens blank.”; “I cannot find the menu.”; complaint_or_objection — “This is too expensive.”; “That step seems risky.”; testimonial_or_result — “I saved two hours.”; “My sales increased.”; topic_request — “Please cover budgeting.”; “Show an interview setup.”; language_or_subtitles_request — “Add French captions.”; “Could you translate this?”; alternative_or_tool_request — “Compare it with Tool A.”; “Can you show another app?”; format_request — “Make a short version.”; “Add a checklist.”; praise — “This was clear.”; “Great walkthrough.”; spam_or_noise — “🔥🔥”; “...”",
     "Questions, requests, objections, and testimonials must not be labelled spam_or_noise. Only emoji-only, one-word, or content-free comments are noise.",
     "For questions use how_to_question unless they are about buying or sponsorship; for objections use complaint_or_objection; for viewer outcomes use testimonial_or_result. Use language_or_subtitles_request for translation/subtitles; alternative_or_tool_request for other tools; format_request for delivery format.",
     "Return exactly one item for every supplied integer id. Use only those ids; do not omit, duplicate, or add ids.",
@@ -382,6 +396,9 @@ async function requestProvider(
   modelOptions: Record<string, GeminiModelOptions>,
   droppedByModel: Map<string, Set<"thinkingConfig" | "responseSchema">>,
   commentTexts: string[],
+  batchNumber: number,
+  analysisAttempt: number,
+  onProviderExchange?: LlmOptions["onProviderExchange"],
 ): Promise<
   ReturnType<typeof extractText> & { model: string; droppedFields: string[] }
 > {
@@ -409,11 +426,7 @@ async function requestProvider(
       body = {
         contents: [{ parts: [{ text: prompt }] }],
         systemInstruction: {
-          parts: [
-            {
-              text: "Classify each supplied comment according to the user's classification instructions. Return only the requested JSON.",
-            },
-          ],
+          parts: [{ text: geminiSystemInstruction }],
         },
         generationConfig: {
           responseMimeType:
@@ -479,12 +492,22 @@ async function requestProvider(
           redactSecrets(error instanceof Error ? error.message : String(error)),
         );
       }
+      const rawResponse = await response.text();
       let responseBody: unknown;
       try {
-        responseBody = await response.json();
+        responseBody = JSON.parse(rawResponse) as unknown;
       } catch {
         responseBody = {};
       }
+      await onProviderExchange?.({
+        batch: batchNumber,
+        attempt: analysisAttempt,
+        prompt,
+        ...(provider === "gemini"
+          ? { systemInstruction: geminiSystemInstruction }
+          : {}),
+        rawResponse,
+      });
       if (response.ok)
         return {
           ...extractText(provider, responseBody),
@@ -709,6 +732,7 @@ export async function analyzeComments(
   let successfulBatches = 0;
   let commentsSentToLlm = 0;
   const failedBatches: FailedBatch[] = [];
+  let suspiciousAllNoise = false;
   const fetcher = options.fetcher ?? fetch;
   const provider = options.provider;
   const droppedByModel = new Map<
@@ -720,13 +744,36 @@ export async function analyzeComments(
     ((milliseconds) =>
       new Promise((resolve) => setTimeout(resolve, milliseconds)));
   for (let offset = 0; offset < comments.length; offset += batchSize) {
-    const batch = comments
-      .slice(offset, offset + batchSize)
-      .filter((comment) => !isLowInformationComment(comment.text));
+    const fullBatch = comments.slice(offset, offset + batchSize);
+    const batch = fullBatch.filter(
+      (comment) => !isLowInformationComment(comment.text),
+    );
     const batchNumber = Math.floor(offset / batchSize) + 1;
     options.onProgress?.(`Classifying batch ${batchNumber} of ${batchCount}.`);
     if (batch.length === 0) {
       successfulBatches += 1;
+      options.onBatchEvent?.({
+        batch: batchNumber,
+        totalBatches: batchCount,
+        attempt: 1,
+        outcome: "success",
+        commentsSent: 0,
+        itemsReturned: 0,
+        itemsValid: 0,
+        missingCount: 0,
+        duplicateCount: 0,
+        unknownIdCount: 0,
+        firstRawIds: [],
+        nonEmptyTextCount: fullBatch.filter((comment) => comment.text.trim())
+          .length,
+        averageTextLength: Math.round(
+          fullBatch.reduce((total, comment) => total + comment.text.length, 0) /
+            fullBatch.length,
+        ),
+        minimumTextLength: Math.min(
+          ...fullBatch.map((comment) => comment.text.length),
+        ),
+      });
       continue;
     }
     const prompt = buildClassificationPrompt(batch);
@@ -761,6 +808,7 @@ export async function analyzeComments(
         failedBatches,
         commentsSentToLlm,
         unclassifiedCount: countUnclassified(comments, classifications),
+        suspiciousAllNoise,
         classificationSucceeded: false,
       };
     }
@@ -798,6 +846,7 @@ export async function analyzeComments(
       const processChunk = async (
         chunk: CommentRecord[],
         chunkLabel: string,
+        modelOverride?: string,
       ): Promise<ChunkResult> => {
         let pendingComments = chunk;
         const accepted: ClassificationResult = [];
@@ -823,8 +872,8 @@ export async function analyzeComments(
           try {
             response = await requestProvider(
               llmProvider,
-              options.model!,
-              options.fallbackModel,
+              modelOverride ?? options.model!,
+              modelOverride ? undefined : options.fallbackModel,
               options.apiKey!,
               `${chunkPrompt}${strictReminder}`,
               chunkOutputLimit,
@@ -834,6 +883,9 @@ export async function analyzeComments(
               options.modelOptions ?? {},
               droppedByModel,
               pendingComments.map((comment) => comment.text),
+              batchNumber,
+              attempt,
+              options.onProviderExchange,
             );
           } catch (error) {
             const droppedFields = [
@@ -878,6 +930,22 @@ export async function analyzeComments(
               : {}),
             rawResponseTextLength: response.text.length,
             model: response.model,
+            nonEmptyTextCount: pendingComments.filter((comment) =>
+              comment.text.trim(),
+            ).length,
+            averageTextLength: pendingComments.length
+              ? Math.round(
+                  pendingComments.reduce(
+                    (total, comment) => total + comment.text.length,
+                    0,
+                  ) / pendingComments.length,
+                )
+              : 0,
+            minimumTextLength: pendingComments.length
+              ? Math.min(
+                  ...pendingComments.map((comment) => comment.text.length),
+                )
+              : 0,
             ...(response.droppedFields.length > 0
               ? { droppedFields: response.droppedFields }
               : {}),
@@ -1064,13 +1132,59 @@ export async function analyzeComments(
       outputTokens = chunkResult.outputTokens;
       result = chunkResult.result;
       batchUnclassifiedCount = chunkResult.unclassifiedCount;
-      if (chunkResult.unclassifiedCount > 0) {
+      let batchFailureReason = chunkResult.reason;
+      const batchNoiseRatio = (items: ClassificationResult) => {
+        const byId = new Map(
+          items.map((classification) => [
+            classification.commentId,
+            classification.category,
+          ]),
+        );
+        const noiseCount = fullBatch.filter((comment) => {
+          if (isLowInformationComment(comment.text)) return true;
+          return byId.get(comment.commentId) === "spam_or_noise";
+        }).length;
+        return noiseCount / Math.max(1, fullBatch.length);
+      };
+      if (fullBatch.length >= 10 && batchNoiseRatio(result) > 0.9) {
+        console.warn(
+          `Warning: classification batch ${batchNumber} is suspicious: more than 90% of comments were labeled spam_or_noise.`,
+        );
+        if (options.fallbackModel && options.fallbackModel !== options.model) {
+          options.onProgress?.(
+            `Retrying suspicious all-noise batch ${batchNumber} with fallback model.`,
+          );
+          const fallbackResult = await processChunk(
+            batch,
+            `${batchNumber}.fallback`,
+            options.fallbackModel,
+          );
+          inputTokens += fallbackResult.inputTokens;
+          outputTokens += fallbackResult.outputTokens;
+          result = fallbackResult.result;
+          batchUnclassifiedCount = fallbackResult.unclassifiedCount;
+          batchFailureReason = fallbackResult.reason;
+          if (batchNoiseRatio(result) > 0.9) suspiciousAllNoise = true;
+          if (fallbackResult.unclassifiedCount > 0) {
+            failedBatches.push({
+              batch: batchNumber,
+              reason: fallbackResult.reason ?? "coverage_failure",
+            });
+          }
+        } else {
+          suspiciousAllNoise = true;
+          console.warn(
+            "Warning: no distinct fallback model is configured; this run is marked incomplete.",
+          );
+        }
+      }
+      if (batchUnclassifiedCount > 0) {
         failedBatches.push({
           batch: batchNumber,
-          reason: chunkResult.reason ?? "coverage_failure",
+          reason: batchFailureReason ?? "coverage_failure",
         });
         console.warn(
-          `Warning: ${chunkResult.unclassifiedCount} comment(s) in classification batch ${batchNumber} of ${batchCount} remained unclassified after retry.`,
+          `Warning: ${batchUnclassifiedCount} comment(s) in classification batch ${batchNumber} of ${batchCount} remained unclassified after retry.`,
         );
       }
     }
@@ -1101,6 +1215,7 @@ export async function analyzeComments(
         failedBatches,
         commentsSentToLlm,
         unclassifiedCount: countUnclassified(comments, classifications),
+        suspiciousAllNoise,
         classificationSucceeded: false,
       };
     }
@@ -1114,6 +1229,8 @@ export async function analyzeComments(
     failedBatches,
     commentsSentToLlm,
     unclassifiedCount: countUnclassified(comments, classifications),
-    classificationSucceeded: countUnclassified(comments, classifications) === 0,
+    suspiciousAllNoise,
+    classificationSucceeded:
+      countUnclassified(comments, classifications) === 0 && !suspiciousAllNoise,
   };
 }
