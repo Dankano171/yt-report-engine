@@ -1,10 +1,17 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { detectKeywordResponses } from "./classification.js";
+import {
+  detectKeywordResponses,
+  isLowInformationComment,
+} from "./classification.js";
 import { sendEmail } from "./email.js";
 import { analyzeComments, type FailedBatch } from "./llm.js";
-import { renderReport } from "./report.js";
-import { appendUsage, cacheComments } from "./storage.js";
+import {
+  clusterReportSections,
+  renderReport,
+  type ReportClusters,
+} from "./report.js";
+import { appendUsage, cacheComments, readUsage } from "./storage.js";
 import { fetchChannelData } from "./youtube.js";
 import { redactSecrets } from "./errors.js";
 import type {
@@ -40,6 +47,8 @@ export interface RunStats {
   creatorComments: number;
   commentsSentToLlm: number;
   commentsClassified: number;
+  commentsClassifiedByLlm: number;
+  commentsClassifiedByRules: number;
   commentsExcluded: number;
   commentsNotAnalyzed: number;
   emptyText: number;
@@ -100,6 +109,8 @@ function emptyCategoryCounts(): Record<Category, number> {
     praise: 0,
     spam_or_noise: 0,
     keyword_response: 0,
+    suspected_bot_or_promo: 0,
+    purchase_intent: 0,
   };
 }
 
@@ -198,6 +209,8 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
       creatorComments,
       commentsSentToLlm: 0,
       commentsClassified: 0,
+      commentsClassifiedByLlm: 0,
+      commentsClassifiedByRules: 0,
       commentsExcluded: creatorComments + emptyText,
       commentsNotAnalyzed: 0,
       emptyText,
@@ -267,9 +280,16 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   const dumpedBatches = new Set<number>();
   const analysis = await analyzeComments(analysisComments, {
     provider: options.config.provider,
-    ...(options.config.model ? { model: options.config.model } : {}),
-    ...(options.config.fallbackModel
-      ? { fallbackModel: options.config.fallbackModel }
+    ...((options.config.classificationModel ?? options.config.model)
+      ? { model: options.config.classificationModel ?? options.config.model }
+      : {}),
+    ...((options.config.classificationFallbackModel ??
+    options.config.fallbackModel)
+      ? {
+          fallbackModel:
+            options.config.classificationFallbackModel ??
+            options.config.fallbackModel,
+        }
       : {}),
     ...(options.config.modelOptions
       ? { modelOptions: options.config.modelOptions }
@@ -394,7 +414,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   const suspiciousReason =
     "A batch remained more than 90% spam_or_noise after fallback-model verification.";
   console.log("Verifying quotes.");
-  const rendered = renderReport({
+  const reportInput = {
     channel: options.channel,
     videos: data.videos,
     comments: nonEmptyComments,
@@ -415,12 +435,50 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
                 : `${analysis.failedBatches.length} classification batch(es) failed after retry; see stats.json.`),
         }
       : {}),
-  });
+  };
+  let reportClusters: ReportClusters = {};
+  if (!options.classifyOnly && options.config.provider !== "mock") {
+    const usageRows = await readUsage(options.usagePath);
+    const dailyUsed = usageRows
+      .filter((record) => record.date === now.toISOString().slice(0, 10))
+      .reduce((total, record) => total + record.estimatedUsd, 0);
+    let runBudget =
+      options.config.limits.maxUsdPerRun - analysis.usage.estimatedUsd;
+    let dailyBudget =
+      options.config.limits.maxUsdPerDay -
+      dailyUsed -
+      analysis.usage.estimatedUsd;
+    const reserveUsd = (estimate: number) => {
+      if (estimate > runBudget || estimate > dailyBudget) return false;
+      runBudget -= estimate;
+      dailyBudget -= estimate;
+      return true;
+    };
+    reportClusters = await clusterReportSections(
+      reportInput,
+      options.config,
+      options.fetcher,
+      now,
+      (record) => appendUsage(record, options.usagePath),
+      reserveUsd,
+    );
+  }
+  const rendered = renderReport(reportInput, reportClusters);
   await mkdir(folder, { recursive: true });
   const classificationsByCategory = emptyCategoryCounts();
   for (const classification of classifications)
     classificationsByCategory[classification.category] += 1;
   const commentsClassified = classifications.length;
+  const commentsClassifiedByRules = classifications.filter(
+    (classification) =>
+      classification.category === "keyword_response" ||
+      (classification.category === "spam_or_noise" &&
+        analysisComments.some(
+          (comment) =>
+            comment.commentId === classification.commentId &&
+            isLowInformationComment(comment.text),
+        )),
+  ).length;
   const stats: RunStats = {
     date: now.toISOString().slice(0, 10),
     videosAnalyzed: data.videos.length,
@@ -428,6 +486,8 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     creatorComments,
     commentsSentToLlm: analysis.commentsSentToLlm,
     commentsClassified,
+    commentsClassifiedByLlm: commentsClassified - commentsClassifiedByRules,
+    commentsClassifiedByRules,
     commentsExcluded: creatorComments + emptyText,
     commentsNotAnalyzed,
     emptyText,
@@ -529,7 +589,6 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
 }
 
 function printRunSummary(stats: RunStats): void {
-  const classified = stats.commentsClassified;
   const droppedTotal = Object.values(stats.droppedQuotes).reduce(
     (total, count) => total + count,
     0,
@@ -540,6 +599,9 @@ function printRunSummary(stats: RunStats): void {
   console.log(`  Creator comments excluded: ${stats.creatorComments}`);
   console.log(`  Comments sent to the LLM: ${stats.commentsSentToLlm}`);
   console.log(`  Comments classified: ${stats.commentsClassified}`);
+  console.log(
+    `  Classified by model/rules: ${stats.commentsClassifiedByLlm}/${stats.commentsClassifiedByRules}`,
+  );
   console.log(`  Comments excluded: ${stats.commentsExcluded}`);
   console.log(`  Comments not analyzed: ${stats.commentsNotAnalyzed}`);
   console.log(`  Comments with empty text: ${stats.emptyText}`);
@@ -547,7 +609,6 @@ function printRunSummary(stats: RunStats): void {
   console.log(
     `  Classification status: ${stats.classificationSucceeded ? "complete" : "incomplete"}${stats.stoppedReason ? ` (${stats.stoppedReason})` : ""}`,
   );
-  console.log(`  Comments classified: ${classified}`);
   console.log(
     `  Categories: ${Object.entries(stats.classificationsByCategory)
       .map(([category, count]) => `${category}=${count}`)

@@ -9,7 +9,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { analyzeComments, buildClassificationPrompt } from "../src/llm.js";
+import {
+  analyzeComments,
+  buildClassificationPrompt,
+  clusterComments,
+} from "../src/llm.js";
 import { renderReport } from "../src/report.js";
 import { isLowInformationComment } from "../src/classification.js";
 import {
@@ -93,6 +97,109 @@ describe("comment analysis safety", () => {
     expect(prompt).toContain("What does it cost?");
     expect(prompt).toContain("Can my team buy access?");
     expect(prompt).toContain("COMMENT DATA END");
+  });
+
+  it("retries title-copying clusters and validates their short integer IDs", async () => {
+    const prompts: string[] = [];
+    const responses = [
+      JSON.stringify([
+        {
+          title: "How do I use",
+          ids: [1, 2],
+          paraphrase: "Viewers ask about setup.",
+        },
+      ]),
+      JSON.stringify([
+        {
+          title: "Using the lesson setup",
+          ids: ["1", 2],
+          paraphrase: "Viewers ask how to set up the lesson.",
+        },
+      ]),
+    ];
+    const fetcher: Fetcher = async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        messages: { content: string }[];
+      };
+      prompts.push(request.messages[0]!.content);
+      return openAiResponse(responses.shift() ?? "[]");
+    };
+    const clusters = await clusterComments(
+      [
+        comment,
+        { ...comment, commentId: "yt-long-id", text: "Where is the menu?" },
+      ],
+      {
+        provider: "openai",
+        model: "writer",
+        apiKey: "test-key",
+        fetcher,
+        section: "ideas",
+      },
+    );
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).not.toContain("yt-long-id");
+    expect(clusters).toEqual([
+      {
+        title: "Using the lesson setup",
+        ids: [1, 2],
+        paraphrase: "Viewers ask how to set up the lesson.",
+      },
+    ]);
+  });
+
+  it("rejects unknown and duplicate cluster IDs after one retry", async () => {
+    let calls = 0;
+    const fetcher: Fetcher = async () => {
+      calls += 1;
+      return openAiResponse(
+        JSON.stringify([
+          {
+            title: "Member access",
+            ids: calls <= 2 ? [1, 9] : [1, 1],
+          },
+        ]),
+      );
+    };
+    const options = {
+      provider: "openai",
+      model: "writer",
+      apiKey: "test-key",
+      fetcher,
+      section: "fixes",
+    } as const;
+    await expect(clusterComments([comment], options)).resolves.toEqual([]);
+    await expect(clusterComments([comment], options)).resolves.toEqual([]);
+    expect(calls).toBe(4);
+  });
+
+  it("classifies promotional text, purchase intent, and tool opinions separately", async () => {
+    const promo = {
+      ...comment,
+      commentId: "promo",
+      text: "Our revolutionary platform empowers every creator to unlock limitless success with a global network, visit my profile for a free consultation and message me today to learn how our unrelated service can transform your business.",
+    };
+    const results = await analyzeComments(
+      [
+        promo,
+        {
+          ...comment,
+          commentId: "intent",
+          text: "I just bought the annual plan.",
+        },
+        { ...comment, commentId: "opinion", text: "I'm not a fan of Tool A." },
+      ],
+      {
+        provider: "mock",
+        maxUsdPerRun: 1,
+        maxUsdPerDay: 1,
+      },
+    );
+    expect(results.classifications.map(({ category }) => category)).toEqual([
+      "suspected_bot_or_promo",
+      "purchase_intent",
+      "complaint_or_objection",
+    ]);
   });
 
   it("omits empty-text comments while preserving text and likes in the prompt", async () => {
@@ -910,7 +1017,7 @@ describe("report generation", () => {
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
     expect(report.markdown).toContain("## E. Already answered: pin these");
-    expect(report.markdown).toContain("2 viewers");
+    expect(report.markdown).toContain("1 viewer (single mention)");
     expect(report.markdown).toContain(
       "https://www.youtube.com/watch?v=v1&lc=answered1.reply1",
     );
@@ -940,7 +1047,7 @@ describe("report generation", () => {
     });
     expect(report.markdown).toContain("## C. Fix list");
     expect(report.markdown).toContain(
-      "**This Strategy Only Works In Bull Markets** — 1 viewer (single mention) · 1 comment",
+      "**Complaint Or Objection** — 1 viewer (single mention) · 1 comment",
     );
     expect(report.markdown).toContain(objection);
   });
@@ -1031,7 +1138,7 @@ describe("report generation", () => {
     expect(report.html).toContain("Keyword response: full course");
   });
 
-  it("uses comment-derived grouped titles, shows three quotes, and reports remaining counts", () => {
+  it("uses category fallbacks and leaves comments ungrouped when no clusters are available", () => {
     const howToTexts = [
       "How do I access the prompt for channel members?",
       "How can I access the prompt for channel members?",
@@ -1067,44 +1174,149 @@ describe("report generation", () => {
       classifications,
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
-    expect(report.markdown).toContain(
-      "**Access The Prompt For Channel Members**",
-    );
-    expect(report.markdown).toContain("4 comments");
-    expect(report.markdown).toContain("and 1 more");
+    expect(report.markdown).toContain("**How To Question**");
+    expect(report.markdown).toContain("**Complaint Or Objection**");
+    expect(report.markdown).toContain("1 comment");
     expect(report.markdown).not.toContain(
       "Question that could inspire an idea",
     );
-    expect(report.markdown).toContain(
-      "**Prompt Access Is Confusing For Members**",
-    );
-    expect(report.markdown).toContain("4 answered comments");
-    expect(report.html).toContain("Access The Prompt For Channel Members");
-    expect(report.html).toContain("and 1 more");
+    expect(report.markdown).not.toContain("and 1 more");
+    expect(report.html).toContain("How To Question");
   });
 
-  it("labels response guidance as suggestions and never includes model promises", () => {
+  it("renders validated cluster titles without markdown escapes or copied comment openings", () => {
+    const commentOne = {
+      ...comment,
+      commentId: "c1",
+      text: "Could you compare Claude with other AI tools?",
+    };
+    const commentTwo = {
+      ...comment,
+      commentId: "c2",
+      text: "Can you explain using a different assistant?",
+    };
+    const report = renderReport(
+      {
+        channel,
+        videos: [video],
+        comments: [commentOne, commentTwo],
+        classifications: [commentOne, commentTwo].map((entry) => ({
+          commentId: entry.commentId,
+          category: "alternative_or_tool_request" as const,
+          quote: entry.text,
+        })),
+        dateRange: { from: "2026-02-13", to: "2026-03-15" },
+      },
+      {
+        ideas: {
+          clusters: [
+            {
+              title: "Using other AIs instead of Claude",
+              ids: [1, 2],
+              paraphrase: "Viewers ask about alternatives to Claude.",
+            },
+          ],
+          commentIds: ["c1", "c2"],
+        },
+      },
+    );
+    expect(report.markdown).toContain("**Using other AIs instead of Claude**");
+    expect(report.markdown).toContain("2 comments");
+    expect(report.markdown).not.toContain("\\");
+    expect(report.html).toContain("Using other AIs instead of Claude");
+  });
+
+  it("puts a post-purchase access problem before other unanswered questions", () => {
+    const problemText =
+      "I paid for membership but the access link asks for a password and doesn't work.";
+    const purchaseText = "How much does access cost?";
+    const comments = [
+      { ...comment, commentId: "purchase", text: purchaseText },
+      { ...comment, commentId: "problem", text: problemText },
+    ];
     const report = renderReport({
       channel,
       videos: [video],
-      comments: [comment],
+      comments,
       classifications: [
         {
-          commentId: "c1",
+          commentId: "purchase",
           category: "buying_or_sponsor_inquiry",
-          quote: comment.text,
+          quote: purchaseText,
+        },
+        {
+          commentId: "problem",
+          category: "confusion_or_error",
+          quote: problemText,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const problemIndex = report.markdown.indexOf("Customer problem:");
+    const purchaseIndex = report.markdown.indexOf("Buying Or Sponsor Inquiry");
+    expect(problemIndex).toBeGreaterThan(-1);
+    expect(problemIndex).toBeLessThan(purchaseIndex);
+  });
+
+  it("counts bot/promo and purchase intent in Quick pulse but excludes both from findings", () => {
+    const promo = {
+      ...comment,
+      commentId: "promo",
+      text: "Our unrelated service is revolutionary and visit my profile today.",
+    };
+    const intent = {
+      ...comment,
+      commentId: "intent",
+      text: "I just bought the annual plan.",
+    };
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [promo, intent],
+      classifications: [
+        {
+          commentId: "promo",
+          category: "suspected_bot_or_promo",
+          quote: promo.text,
+        },
+        {
+          commentId: "intent",
+          category: "purchase_intent",
+          quote: intent.text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain("Suspected bot/promo: 1 (50%)");
+    expect(report.markdown).toContain("Purchase intent: 1 (50%)");
+    expect(report.markdown).not.toContain(promo.text);
+    expect(report.markdown).not.toContain(intent.text);
+  });
+
+  it("omits boilerplate guidance and never includes model promises", () => {
+    const actionableComment = {
+      ...comment,
+      text: "How much does access cost?",
+    };
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [actionableComment],
+      classifications: [
+        {
+          commentId: actionableComment.commentId,
+          category: "buying_or_sponsor_inquiry",
+          quote: actionableComment.text,
           draftReply: "I'll send you a discount tomorrow.",
         },
       ],
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
-    expect(report.markdown).toContain(
-      "Suggestions only — not a reply to post.",
-    );
-    expect(report.markdown).toContain("Points to cover:");
+    expect(report.markdown).toContain("Viewer asks:");
+    expect(report.markdown).not.toContain("Points to cover:");
     expect(report.markdown).not.toContain("I'll send you a discount tomorrow");
     expect(report.markdown).not.toContain("I’ll share more details");
-    expect(report.html).toContain("Suggestions only");
+    expect(report.html).toContain("Suggestions are not replies to post");
   });
 
   it("truncates long quotes at a word boundary and adds an ellipsis", () => {

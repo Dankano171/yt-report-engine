@@ -27,6 +27,10 @@ const configSchema = z
       .default("gemini"),
     model: z.string().min(1).optional(),
     fallbackModel: z.string().min(1).optional(),
+    classificationModel: z.string().min(1).optional(),
+    classificationFallbackModel: z.string().min(1).optional(),
+    writingModel: z.string().min(1).optional(),
+    writingFallbackModel: z.string().min(1).optional(),
     modelOptions: z
       .record(
         z.object({
@@ -82,10 +86,19 @@ export async function loadConfig(path = "config.json"): Promise<AppConfig> {
     );
   }
   const data = result.data;
+  const classificationModel = data.classificationModel ?? data.model;
+  const writingModel = data.writingModel ?? data.model;
+  const classificationFallbackModel =
+    data.classificationFallbackModel ?? data.fallbackModel;
+  const writingFallbackModel = data.writingFallbackModel ?? data.fallbackModel;
   return {
     provider: data.provider,
     ...(data.model ? { model: data.model } : {}),
     ...(data.fallbackModel ? { fallbackModel: data.fallbackModel } : {}),
+    ...(classificationModel ? { classificationModel } : {}),
+    ...(classificationFallbackModel ? { classificationFallbackModel } : {}),
+    ...(writingModel ? { writingModel } : {}),
+    ...(writingFallbackModel ? { writingFallbackModel } : {}),
     ...(data.modelOptions ? { modelOptions: data.modelOptions } : {}),
     ...(data.emailFrom ? { emailFrom: data.emailFrom } : {}),
     limits: data.limits,

@@ -197,7 +197,7 @@ describe("run pipeline", () => {
       commentsFetched: 1,
       commentsSentToLlm: 0,
       classificationsByCategory: { how_to_question: 1 },
-      reportItemsBySection: { money: 1 },
+      reportItemsBySection: { money: 0 },
       droppedQuotes: {
         emptyQuote: 0,
         quoteNotFound: 0,
@@ -280,6 +280,10 @@ describe("run pipeline", () => {
         result.stats.commentsClassified +
         result.stats.unclassified,
     );
+    expect(result.stats.commentsClassified).toBe(
+      result.stats.commentsClassifiedByLlm +
+        result.stats.commentsClassifiedByRules,
+    );
     const markdown = await readFile(
       join(result.reportFolder, "report.md"),
       "utf8",
@@ -287,6 +291,35 @@ describe("run pipeline", () => {
     expect(markdown).not.toContain(texts[0]);
     expect(markdown).toContain(texts[2]);
     expect(markdown).toContain(texts[3]);
+  });
+
+  it("accounts for deterministic noise rules separately from LLM classifications", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-accounting-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-secret";
+    const result = await runChannel({
+      channel,
+      config,
+      days: 30,
+      send: false,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: fetcher(2, ["How do I set this up?", "thanks"]),
+      wait: async () => {},
+    });
+    expect(result.stats.commentsClassified).toBe(
+      result.stats.commentsClassifiedByLlm +
+        result.stats.commentsClassifiedByRules,
+    );
+    expect(result.stats.commentsClassifiedByRules).toBe(1);
+    expect(result.stats.commentsClassifiedByLlm).toBe(1);
+    expect(result.stats.commentsFetched).toBe(
+      result.stats.commentsExcluded +
+        result.stats.commentsNotAnalyzed +
+        result.stats.commentsClassified +
+        result.stats.unclassified,
+    );
   });
 
   it("classifies repeated short phrases as keyword responses without an LLM call", async () => {

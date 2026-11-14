@@ -2,6 +2,10 @@
   "provider": "gemini",
   "model": "gemini-flash-lite-latest",
   "fallbackModel": "gemini-2.5-flash",
+  "classificationModel": "gemini-flash-lite-latest",
+  "classificationFallbackModel": "gemini-2.5-flash",
+  "writingModel": "gemini-flash-lite-latest",
+  "writingFallbackModel": "gemini-2.5-flash",
   "emailFrom": "Creator Reports <reports@your-verified-domain.example>",
   "limits": {
     "maxVideos": 8,

@@ -142,6 +142,7 @@ function commentFrom(
   totalReplyCount: number,
   creatorReplied: boolean,
   creatorReplyId?: string,
+  creatorReplyText?: string,
 ): CommentRecord {
   const snippet = object(object(raw).snippet);
   const author = object(snippet.authorChannelId);
@@ -157,7 +158,16 @@ function commentFrom(
     ...(string(author.value) ? { authorChannelId: string(author.value) } : {}),
     creatorReplied,
     ...(creatorReplyId ? { creatorReplyId } : {}),
+    ...(creatorReplyText ? { creatorReplyText } : {}),
   };
+}
+
+function replyText(raw: unknown): string {
+  const snippet = object(object(raw).snippet);
+  const original = string(snippet.textOriginal);
+  return original.trim()
+    ? original
+    : plainTextFromHtml(string(snippet.textDisplay));
 }
 
 export async function fetchChannelData(
@@ -316,6 +326,9 @@ export async function fetchChannelData(
         let creatorReplyId = creatorReply
           ? string(object(creatorReply).id) || undefined
           : undefined;
+        let creatorReplyText = creatorReply
+          ? replyText(creatorReply)
+          : undefined;
         if (totalReplies > replies.length) {
           let replyToken: string | undefined;
           let repliesLoaded = 0;
@@ -349,6 +362,9 @@ export async function fetchChannelData(
               (loadedCreatorReply
                 ? string(object(loadedCreatorReply).id)
                 : "") || undefined;
+            creatorReplyText ||= loadedCreatorReply
+              ? replyText(loadedCreatorReply)
+              : undefined;
             repliesLoaded += loaded.length;
             replyToken = replyPage.nextPageToken;
           } while (replyToken && repliesLoaded < totalReplies);
@@ -360,6 +376,7 @@ export async function fetchChannelData(
             totalReplies,
             creatorReplied,
             creatorReplyId,
+            creatorReplyText,
           ),
         );
       }

@@ -67,7 +67,10 @@ function fakeYouTubeFetch(): Fetcher {
               comments: [
                 {
                   id: "comment-1.reply-1",
-                  snippet: { authorChannelId: { value: "UCcreator" } },
+                  snippet: {
+                    authorChannelId: { value: "UCcreator" },
+                    textOriginal: "The download link is in the description.",
+                  },
                 },
               ],
             },
@@ -99,6 +102,9 @@ describe("YouTube data", () => {
     expect(result.comments[0]?.publishedAt).toBe(publishedAt);
     expect(result.comments[0]?.creatorReplied).toBe(true);
     expect(result.comments[0]?.creatorReplyId).toBe("comment-1.reply-1");
+    expect(result.comments[0]?.creatorReplyText).toBe(
+      "The download link is in the description.",
+    );
     expect(result.comments[0]?.totalReplyCount).toBe(1);
   });
 

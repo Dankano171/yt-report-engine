@@ -13,7 +13,9 @@ export type Category =
   | "format_request"
   | "praise"
   | "spam_or_noise"
-  | "keyword_response";
+  | "keyword_response"
+  | "suspected_bot_or_promo"
+  | "purchase_intent";
 
 export interface ChannelConfig {
   handle?: string;
@@ -35,6 +37,10 @@ export interface AppConfig {
   provider: ProviderName;
   model?: string;
   fallbackModel?: string;
+  classificationModel?: string;
+  classificationFallbackModel?: string;
+  writingModel?: string;
+  writingFallbackModel?: string;
   modelOptions?: Record<string, GeminiModelOptions>;
   emailFrom?: string;
   limits: {
@@ -68,6 +74,7 @@ export interface CommentRecord {
   authorChannelId?: string;
   creatorReplied: boolean;
   creatorReplyId?: string;
+  creatorReplyText?: string;
 }
 
 export interface Classification {
