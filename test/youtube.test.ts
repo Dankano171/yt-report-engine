@@ -66,7 +66,7 @@ function fakeYouTubeFetch(): Fetcher {
             replies: {
               comments: [
                 {
-                  id: "reply-1",
+                  id: "comment-1.reply-1",
                   snippet: { authorChannelId: { value: "UCcreator" } },
                 },
               ],
@@ -98,7 +98,7 @@ describe("YouTube data", () => {
     expect(result.comments[0]?.authorChannelId).toBe("UCviewer");
     expect(result.comments[0]?.publishedAt).toBe(publishedAt);
     expect(result.comments[0]?.creatorReplied).toBe(true);
-    expect(result.comments[0]?.creatorReplyId).toBe("reply-1");
+    expect(result.comments[0]?.creatorReplyId).toBe("comment-1.reply-1");
     expect(result.comments[0]?.totalReplyCount).toBe(1);
   });
 
@@ -108,8 +108,8 @@ describe("YouTube data", () => {
     );
   });
 
-  it("builds the canonical creator-reply deep link", () => {
-    expect(buildDeepLink("video1", "comment1", "reply1")).toBe(
+  it("uses the complete API reply id without duplicating its parent id", () => {
+    expect(buildDeepLink("video1", "comment1", "comment1.reply1")).toBe(
       "https://www.youtube.com/watch?v=video1&lc=comment1.reply1",
     );
   });

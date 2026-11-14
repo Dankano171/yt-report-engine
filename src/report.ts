@@ -5,7 +5,11 @@ import type {
   CommentRecord,
   VideoRecord,
 } from "./types.js";
-import { isLowInformationComment } from "./classification.js";
+import {
+  isLowInformationComment,
+  normalizeKeywordResponse,
+  truncateQuote,
+} from "./classification.js";
 import { buildDeepLink } from "./youtube.js";
 
 interface ReportInput {
@@ -62,14 +66,6 @@ function escapeMarkdown(value: string): string {
     .replaceAll("\n", " ");
 }
 
-function safeGeneratedText(value: string): string {
-  return value
-    .replace(/\[[^\]]+\]\(https?:\/\/[^)]+\)/gi, (match) =>
-      match.slice(1, match.indexOf("](")),
-    )
-    .replace(/https?:\/\/\S+/gi, "[link omitted]");
-}
-
 function quoteBlock(quote: string): string {
   const longestBacktickRun = Math.max(
     0,
@@ -97,6 +93,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "format_request",
       "praise",
       "spam_or_noise",
+      "keyword_response",
     ],
     sell_tool: [
       "buying_or_sponsor_inquiry",
@@ -110,6 +107,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "format_request",
       "praise",
       "spam_or_noise",
+      "keyword_response",
     ],
     sponsorships: [
       "buying_or_sponsor_inquiry",
@@ -123,6 +121,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "alternative_or_tool_request",
       "format_request",
       "spam_or_noise",
+      "keyword_response",
     ],
     grow_audience: [
       "topic_request",
@@ -136,6 +135,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "alternative_or_tool_request",
       "format_request",
       "spam_or_noise",
+      "keyword_response",
     ],
   };
   return orders[channel.creatorGoal];
@@ -189,6 +189,27 @@ function topicWords(text: string): Set<string> {
       ?.map((word) => (word.length > 4 ? word.replace(/s$/, "") : word))
       .filter((word) => !questionStopWords.has(word)) ?? [],
   );
+}
+
+function topicTitle(group: FindingGroup): string {
+  const firstText = group.findings[0]?.comment.text ?? "";
+  const words = firstText
+    .replace(/^[\s?!.,"'“”‘’]+|[\s?!.,"'“”‘’]+$/g, "")
+    .split(/\s+/)
+    .filter(Boolean);
+  while (
+    words.length > 0 &&
+    /^(how|what|where|when|why|can|could|would|do|does|is|are|please|anyone|i|you|the|a|an)$/i.test(
+      words[0]!,
+    )
+  ) {
+    words.shift();
+  }
+  const selected = words.slice(0, 8);
+  if (selected.length === 0) return "Viewer feedback";
+  return selected
+    .map((word) => word[0]!.toLocaleUpperCase() + word.slice(1))
+    .join(" ");
 }
 
 interface FindingGroup {
@@ -269,7 +290,7 @@ function findingList(input: ReportInput): {
     findings.push({
       classification: {
         ...classification,
-        quote: comment.text.trim().slice(0, 300),
+        quote: truncateQuote(comment.text),
       },
       comment,
       video,
@@ -327,6 +348,26 @@ function renderMarkdown(
       (classification.category === "buying_or_sponsor_inquiry" ||
         (classification.category === "how_to_question" &&
           comment.likeCount >= 5)),
+  );
+  const keywordResponses = new Map<string, Finding[]>();
+  for (const finding of ordered.filter(
+    ({ classification }) => classification.category === "keyword_response",
+  )) {
+    const phrase = normalizeKeywordResponse(finding.comment.text);
+    const key = `${finding.comment.videoId}\u0000${phrase}`;
+    keywordResponses.set(key, [...(keywordResponses.get(key) ?? []), finding]);
+  }
+  const keywordResponseGroups = [...keywordResponses.values()].map(
+    (groupFindings) => ({
+      findings: groupFindings,
+      viewers: new Set(
+        groupFindings.map(
+          (finding) =>
+            finding.comment.authorChannelId ?? finding.comment.commentId,
+        ),
+      ).size,
+      phrase: normalizeKeywordResponse(groupFindings[0]!.comment.text),
+    }),
   );
   const requestCategories = new Set<Category>([
     "how_to_question",
@@ -418,44 +459,30 @@ function renderMarkdown(
     `${count} (${input.comments.length ? Math.round((count / input.comments.length) * 100) : 0}%)`;
   const viewerLabel = (viewers: number) =>
     `${viewers} viewer${viewers === 1 ? "" : "s"}`;
-  const requestTitles: Record<Category, string> = {
-    buying_or_sponsor_inquiry: "Purchase or sponsorship question",
-    how_to_question: "Question that could inspire an idea",
-    confusion_or_error: "Confusion or error",
-    complaint_or_objection: "Objection or limitation",
-    testimonial_or_result: "Viewer result",
-    topic_request: "Topic request",
-    language_or_subtitles_request: "Language or subtitle request",
-    alternative_or_tool_request: "Tool or alternative request",
-    format_request: "Format request",
-    praise: "Praise",
-    spam_or_noise: "Noise",
-  };
   const requestItems = requests.map((group) => {
-    const first = group.findings[0]!;
-    const title =
-      first.classification.category === "topic_request" &&
-      first.classification.idea
-        ? safeGeneratedText(first.classification.idea)
-        : requestTitles[first.classification.category];
+    const title = topicTitle(group);
     const countLabel = `${viewerLabel(group.viewers)}${group.viewers === 1 ? " (single mention)" : ""}`;
-    const examples = group.findings.slice(0, 2);
-    return `- **${escapeMarkdown(title)}** — ${countLabel}\n\n${examples
+    const examples = group.findings.slice(0, 3);
+    const more =
+      group.findings.length > examples.length
+        ? `\n\n  and ${group.findings.length - examples.length} more`
+        : "";
+    return `- **${escapeMarkdown(title)}** — ${countLabel} · ${group.findings.length} comment${group.findings.length === 1 ? "" : "s"}\n\n${examples
       .map(
         (finding) =>
           `[Open comment](${finding.link}) on **${escapeMarkdown(finding.video.title)}**\n\n${quoteBlock(finding.classification.quote)}`,
       )
-      .join("\n\n")}`;
+      .join("\n\n")}${more}`;
   });
   const fixItems = fixes.map((group) => {
-    const title = group.findings.some(
-      (finding) => finding.classification.category === "complaint_or_objection",
-    )
-      ? "Objection or limitation"
-      : "Issue to address";
+    const title = topicTitle(group);
     const countLabel = `${viewerLabel(group.viewers)}${group.viewers === 1 ? " (single mention)" : ""}`;
-    const examples = group.findings.slice(0, 2);
-    return `- **${title}** — ${countLabel}\n\n${examples
+    const examples = group.findings.slice(0, 3);
+    const more =
+      group.findings.length > examples.length
+        ? `\n\n  and ${group.findings.length - examples.length} more`
+        : "";
+    return `- **${escapeMarkdown(title)}** — ${countLabel} · ${group.findings.length} comment${group.findings.length === 1 ? "" : "s"}\n\n${examples
       .map((finding) => {
         const claimedTimestamp = finding.classification.timestamp;
         const timestamp =
@@ -466,12 +493,16 @@ function renderMarkdown(
             : undefined) ?? timestampFrom(finding.comment.text);
         return `[Open comment](${finding.link}) on **${escapeMarkdown(finding.video.title)}${timestamp ? ` at ${timestamp}` : ""}**\n\n${quoteBlock(finding.classification.quote)}`;
       })
-      .join("\n\n")}`;
+      .join("\n\n")}${more}`;
   });
   const answeredItems = answeredQuestions.map((group) => {
     const countLabel = viewerLabel(group.viewers);
-    const examples = group.answeredFindings.slice(0, 2);
-    return `- **Repeated or high-like question** — ${countLabel}\n\n${examples
+    const examples = group.answeredFindings.slice(0, 3);
+    const more =
+      group.answeredFindings.length > examples.length
+        ? `\n\n  and ${group.answeredFindings.length - examples.length} more`
+        : "";
+    return `- **${escapeMarkdown(topicTitle(group))}** — ${countLabel} · ${group.answeredFindings.length} answered comment${group.answeredFindings.length === 1 ? "" : "s"}\n\n${examples
       .map((finding) => {
         const replyLink = finding.comment.creatorReplyId
           ? buildDeepLink(
@@ -490,10 +521,36 @@ function renderMarkdown(
       })
       .join(
         "\n\n",
-      )}\n\n  **Suggestion:** Pin an answer comment or add it to the video description FAQ.`;
+      )}${more}\n\n  **Suggestion:** Consider pinning an answer or adding an FAQ entry.`;
   });
+  const keywordResponseItems = keywordResponseGroups.flatMap((group) => {
+    const unanswered = group.findings.filter(
+      (finding) => !finding.comment.creatorReplied,
+    );
+    if (unanswered.length === 0) return [];
+    const examples = unanswered.slice(0, 3);
+    const more =
+      unanswered.length > examples.length
+        ? `; and ${unanswered.length - examples.length} more`
+        : "";
+    return [
+      `- **Keyword response: ${escapeMarkdown(group.phrase)}** — ${unanswered.length} unanswered comment${unanswered.length === 1 ? "" : "s"}${more}\n\n${examples
+        .map(
+          (finding) =>
+            `[Open comment](${finding.link}) on **${escapeMarkdown(finding.video.title)}**`,
+        )
+        .join("\n\n")}`,
+    ];
+  });
+  const moneyItems = [
+    ...money.map(
+      (finding) =>
+        `${markdownFinding(finding)}\n\n  **Suggestions only — not a reply to post. Points to cover:**\n  - Address the viewer's specific question or inquiry.\n  - Share only details confirmed in the video or description.\n  - Avoid promising anything not stated in the source material.`,
+    ),
+    ...keywordResponseItems,
+  ];
   const sectionItemCounts = {
-    money: money.length,
+    money: moneyItems.length,
     ideas: requests.length,
     fixes: fixes.length,
     proofs: proofs.length,
@@ -505,7 +562,7 @@ function renderMarkdown(
   const sections = [
     `# ${escapeMarkdown(input.channel.creatorName)} — Audience intelligence`,
     "",
-    "> **How to read this:** Viewer quotes and counts are from public comments. AI-generated findings and reply suggestions may be mistaken; review all drafts before use.",
+    "> **How to read this:** Viewer quotes and counts are from public comments. Suggestions are not replies to post; review details against source material.",
     input.stoppedReason ? `\n> **Analysis note:** ${input.stoppedReason}` : "",
     "",
     "## Quick pulse",
@@ -515,22 +572,21 @@ function renderMarkdown(
     `- Requests: ${share(quickPulseCounts.requests)}`,
     `- Objections: ${share(quickPulseCounts.objections)}`,
     `- Noise: ${share(quickPulseCounts.noise)}`,
+    ...keywordResponseGroups.map(
+      (group) =>
+        `- ${viewerLabel(group.viewers)} commented '${escapeMarkdown(group.phrase)}'; the creator replied to ${group.findings.filter((finding) => finding.comment.creatorReplied).length} of them`,
+    ),
     `- Creator replied: ${share(input.comments.filter((comment) => comment.creatorReplied).length)}`,
     input.classificationSucceeded === false
       ? "_Classification incomplete; category shares may be partial._"
       : "",
     "",
     "## A. Money on the table",
-    money.length
-      ? money
-          .map(
-            (finding) =>
-              `${markdownFinding(finding)}\n\n  **DRAFT reply (edit before use):** ${escapeMarkdown(safeGeneratedText(finding.classification.draftReply ?? "Thanks for asking! I’ll share more details with you soon."))}`,
-          )
-          .join("\n\n")
+    moneyItems.length
+      ? moneyItems.join("\n\n")
       : input.classificationSucceeded === false
         ? incompleteMessage
-        : "_No unanswered purchase/sponsor inquiry or high-like question found in the analyzed comments._",
+        : "_No unanswered purchase/sponsor inquiry, high-like question, or keyword response found in the analyzed comments._",
     "",
     "## B. Requests and ideas",
     requestItems.length

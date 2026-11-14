@@ -1,5 +1,6 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { detectKeywordResponses } from "./classification.js";
 import { sendEmail } from "./email.js";
 import { analyzeComments, type FailedBatch } from "./llm.js";
 import { renderReport } from "./report.js";
@@ -36,7 +37,11 @@ export interface RunStats {
   date: string;
   videosAnalyzed: number;
   commentsFetched: number;
+  creatorComments: number;
   commentsSentToLlm: number;
+  commentsClassified: number;
+  commentsExcluded: number;
+  commentsNotAnalyzed: number;
   emptyText: number;
   unclassified: number;
   suspiciousAllNoise: boolean;
@@ -94,6 +99,7 @@ function emptyCategoryCounts(): Record<Category, number> {
     format_request: 0,
     praise: 0,
     spam_or_noise: 0,
+    keyword_response: 0,
   };
 }
 
@@ -169,21 +175,31 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     cacheRoot,
     now,
   );
-  const emptyText = data.comments.filter(
+  const creatorComments = data.comments.filter(
+    (comment) => comment.authorChannelId === data.channelId,
+  ).length;
+  const viewerComments = data.comments.filter(
+    (comment) => comment.authorChannelId !== data.channelId,
+  );
+  const emptyText = viewerComments.filter(
     (comment) => !comment.text.trim(),
   ).length;
   const textLossRatio =
-    data.comments.length > 0 ? emptyText / data.comments.length : 0;
+    viewerComments.length > 0 ? emptyText / viewerComments.length : 0;
   if (textLossRatio > 0.2) {
     const failureReason =
-      `${emptyText} of ${data.comments.length} fetched comments have empty text. ` +
+      `${emptyText} of ${viewerComments.length} viewer comments have empty text. ` +
       "Text was lost during YouTube commentThreads parsing; expected " +
       "item.snippet.topLevelComment.snippet.textOriginal or textDisplay.";
     const stats: RunStats = {
       date: now.toISOString().slice(0, 10),
       videosAnalyzed: data.videos.length,
       commentsFetched: data.comments.length,
+      creatorComments,
       commentsSentToLlm: 0,
+      commentsClassified: 0,
+      commentsExcluded: creatorComments + emptyText,
+      commentsNotAnalyzed: 0,
       emptyText,
       unclassified: 0,
       suspiciousAllNoise: false,
@@ -221,12 +237,33 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
       `${failureReason} Aborting before LLM classification; stats were saved to ${resolve(folder, "stats.json")}.`,
     );
   }
-  const nonEmptyComments = data.comments.filter((comment) =>
+  const nonEmptyComments = viewerComments.filter((comment) =>
     comment.text.trim(),
   );
-  const analysisComments = options.classifyOnly
+  const keywordResponses = detectKeywordResponses(nonEmptyComments);
+  const selectedComments = options.classifyOnly
     ? nonEmptyComments.slice(0, 20)
     : nonEmptyComments;
+  const selectedCommentIds = new Set(
+    selectedComments.map((comment) => comment.commentId),
+  );
+  const keywordClassifications = selectedComments.flatMap((comment) =>
+    keywordResponses.has(comment.commentId)
+      ? [
+          {
+            commentId: comment.commentId,
+            category: "keyword_response" as const,
+            quote: comment.text.trim(),
+          },
+        ]
+      : [],
+  );
+  const analysisComments = selectedComments.filter(
+    (comment) => !keywordResponses.has(comment.commentId),
+  );
+  const commentsNotAnalyzed = nonEmptyComments.filter(
+    (comment) => !selectedCommentIds.has(comment.commentId),
+  ).length;
   const dumpedBatches = new Set<number>();
   const analysis = await analyzeComments(analysisComments, {
     provider: options.config.provider,
@@ -338,6 +375,10 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
       : {}),
     onUsage: (record) => appendUsage(record, options.usagePath),
   });
+  const classifications = [
+    ...analysis.classifications,
+    ...keywordClassifications,
+  ];
   const range = {
     from: new Date(now.getTime() - options.days * 86_400_000)
       .toISOString()
@@ -356,8 +397,8 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   const rendered = renderReport({
     channel: options.channel,
     videos: data.videos,
-    comments: data.comments,
-    classifications: analysis.classifications,
+    comments: nonEmptyComments,
+    classifications,
     dateRange: range,
     classificationSucceeded: analysis.classificationSucceeded,
     ...(analysis.stoppedReason ||
@@ -377,13 +418,18 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   });
   await mkdir(folder, { recursive: true });
   const classificationsByCategory = emptyCategoryCounts();
-  for (const classification of analysis.classifications)
+  for (const classification of classifications)
     classificationsByCategory[classification.category] += 1;
+  const commentsClassified = classifications.length;
   const stats: RunStats = {
     date: now.toISOString().slice(0, 10),
     videosAnalyzed: data.videos.length,
     commentsFetched: data.comments.length,
+    creatorComments,
     commentsSentToLlm: analysis.commentsSentToLlm,
+    commentsClassified,
+    commentsExcluded: creatorComments + emptyText,
+    commentsNotAnalyzed,
     emptyText,
     unclassified: analysis.unclassifiedCount,
     suspiciousAllNoise: analysis.suspiciousAllNoise,
@@ -483,10 +529,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
 }
 
 function printRunSummary(stats: RunStats): void {
-  const classified = Object.values(stats.classificationsByCategory).reduce(
-    (total, count) => total + count,
-    0,
-  );
+  const classified = stats.commentsClassified;
   const droppedTotal = Object.values(stats.droppedQuotes).reduce(
     (total, count) => total + count,
     0,
@@ -494,7 +537,11 @@ function printRunSummary(stats: RunStats): void {
   console.log("Run summary:");
   console.log(`  Videos analyzed: ${stats.videosAnalyzed}`);
   console.log(`  Comments fetched: ${stats.commentsFetched}`);
+  console.log(`  Creator comments excluded: ${stats.creatorComments}`);
   console.log(`  Comments sent to the LLM: ${stats.commentsSentToLlm}`);
+  console.log(`  Comments classified: ${stats.commentsClassified}`);
+  console.log(`  Comments excluded: ${stats.commentsExcluded}`);
+  console.log(`  Comments not analyzed: ${stats.commentsNotAnalyzed}`);
   console.log(`  Comments with empty text: ${stats.emptyText}`);
   console.log(`  Comments unclassified: ${stats.unclassified}`);
   console.log(

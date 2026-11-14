@@ -173,6 +173,7 @@ describe("run pipeline", () => {
       wait: async () => {},
       sendEmailFn,
     });
+
     expect(result.sent).toBe(false);
     expect(sendEmailFn).not.toHaveBeenCalled();
     await expect(
@@ -206,6 +207,149 @@ describe("run pipeline", () => {
     });
   });
 
+  it("excludes creator comments and reconciles fetched, classified, and unclassified counts", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-creator-exclusion-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-secret";
+    process.env.LLM_API_KEY = "test-llm-secret";
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const texts = [
+      "I am the creator promoting my affiliate course",
+      "",
+      "How much does access cost?",
+      "This price is wrong and expensive",
+      "Please add a lesson",
+      "Great explanation",
+    ];
+    const baseFetcher = categorizedFetcher(texts, [
+      "buying_or_sponsor_inquiry",
+      "complaint",
+      "topic_request",
+      "praise",
+    ]);
+    const dataFetcher: Fetcher = async (input, init) => {
+      if (new URL(String(input)).hostname !== "www.googleapis.com")
+        return baseFetcher(input, init);
+      const response = await baseFetcher(input, init);
+      if (!new URL(String(input)).pathname.endsWith("/commentThreads"))
+        return response;
+      const payload = (await response.json()) as {
+        items: {
+          snippet: {
+            topLevelComment: { snippet: Record<string, unknown> };
+          };
+        }[];
+      };
+      payload.items[0]!.snippet.topLevelComment.snippet.authorChannelId = {
+        value: "UCcreator",
+      };
+      payload.items[1]!.snippet.topLevelComment.snippet.textOriginal = "";
+      payload.items[1]!.snippet.topLevelComment.snippet.textDisplay = "";
+      return new Response(JSON.stringify(payload), { status: 200 });
+    };
+    const result = await runChannel({
+      channel,
+      config: { ...config, provider: "openai", model: "test-model" },
+      days: 30,
+      send: false,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: dataFetcher,
+      wait: async () => {},
+    });
+    expect(result.stats).toMatchObject({
+      commentsFetched: 6,
+      creatorComments: 1,
+      emptyText: 1,
+      commentsExcluded: 2,
+      commentsSentToLlm: 4,
+      commentsClassified: 4,
+      commentsNotAnalyzed: 0,
+      unclassified: 0,
+      classificationsByCategory: {
+        buying_or_sponsor_inquiry: 1,
+        complaint_or_objection: 1,
+        topic_request: 1,
+        praise: 1,
+      },
+    });
+    expect(result.stats.commentsFetched).toBe(
+      result.stats.commentsExcluded +
+        result.stats.commentsNotAnalyzed +
+        result.stats.commentsClassified +
+        result.stats.unclassified,
+    );
+    const markdown = await readFile(
+      join(result.reportFolder, "report.md"),
+      "utf8",
+    );
+    expect(markdown).not.toContain(texts[0]);
+    expect(markdown).toContain(texts[2]);
+    expect(markdown).toContain(texts[3]);
+  });
+
+  it("classifies repeated short phrases as keyword responses without an LLM call", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-keyword-response-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-secret";
+    let llmCalls = 0;
+    const youtubeFetcher = fetcher(5, [
+      "FULL course!!!",
+      "full course",
+      "Full course 🔥",
+      "full course?",
+      "full course.",
+    ]);
+    const dataFetcher: Fetcher = async (input, init) => {
+      if (new URL(String(input)).hostname === "www.googleapis.com") {
+        const response = await youtubeFetcher(input, init);
+        if (!new URL(String(input)).pathname.endsWith("/commentThreads"))
+          return response;
+        const payload = (await response.json()) as {
+          items: {
+            snippet: {
+              topLevelComment: { snippet: Record<string, unknown> };
+            };
+          }[];
+        };
+        for (const [index, item] of payload.items.entries())
+          item.snippet.topLevelComment.snippet.authorChannelId = {
+            value: `viewer-${index + 1}`,
+          };
+        return new Response(JSON.stringify(payload), { status: 200 });
+      }
+      llmCalls += 1;
+      return new Response("unexpected LLM call", { status: 500 });
+    };
+    const result = await runChannel({
+      channel,
+      config,
+      days: 30,
+      send: false,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: dataFetcher,
+      wait: async () => {},
+    });
+    expect(llmCalls).toBe(0);
+    expect(result.stats.commentsClassified).toBe(5);
+    expect(result.stats.classificationsByCategory.keyword_response).toBe(5);
+    const markdown = await readFile(
+      join(result.reportFolder, "report.md"),
+      "utf8",
+    );
+    expect(markdown).toContain(
+      "5 viewers commented 'full course'; the creator replied to 0 of them",
+    );
+    expect(markdown).toContain("5 unanswered comments");
+    expect(markdown).toContain("comment1");
+    expect(markdown).toContain("comment2");
+    expect(markdown).toContain("comment3");
+    expect(markdown).not.toContain("comment4");
+    expect(markdown).not.toContain("comment5");
+  });
   it("classifies only the first batch and writes diagnostic stats without a report", async () => {
     root = await mkdtemp(join(tmpdir(), "yt-report-classify-only-"));
     process.env.YOUTUBE_API_KEY = "test-key";

@@ -376,7 +376,7 @@ export function buildDeepLink(
   commentId: string,
   replyId?: string,
 ): string {
-  const linkedCommentId = replyId ? `${commentId}.${replyId}` : commentId;
+  const linkedCommentId = replyId ?? commentId;
   return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&lc=${encodeURIComponent(linkedCommentId)}`;
 }
 

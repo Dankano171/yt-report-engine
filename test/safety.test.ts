@@ -888,7 +888,7 @@ describe("report generation", () => {
           text: "How do I set this up?",
           authorChannelId: "viewer1",
           creatorReplied: true,
-          creatorReplyId: "reply1",
+          creatorReplyId: "answered1.reply1",
         },
         {
           ...comment,
@@ -896,7 +896,7 @@ describe("report generation", () => {
           text: "How can I set this up?",
           authorChannelId: "viewer2",
           creatorReplied: true,
-          creatorReplyId: "reply2",
+          creatorReplyId: "answered2.reply2",
         },
       ],
       classifications: [
@@ -915,7 +915,7 @@ describe("report generation", () => {
       "https://www.youtube.com/watch?v=v1&lc=answered1.reply1",
     );
     expect(report.markdown).toContain(
-      "Pin an answer comment or add it to the video description FAQ.",
+      "Consider pinning an answer or adding an FAQ entry.",
     );
     expect(report.html).toContain("Already answered: pin these");
     expect(report.html).toContain(
@@ -940,7 +940,7 @@ describe("report generation", () => {
     });
     expect(report.markdown).toContain("## C. Fix list");
     expect(report.markdown).toContain(
-      "**Objection or limitation** — 1 viewer (single mention)",
+      "**This Strategy Only Works In Bull Markets** — 1 viewer (single mention) · 1 comment",
     );
     expect(report.markdown).toContain(objection);
   });
@@ -999,6 +999,127 @@ describe("report generation", () => {
     expect(report.html).toContain(
       "[click me](https://www.youtube.com/watch?v=not-fetched)",
     );
+  });
+
+  it("groups repeated keyword responses and lists only unanswered comments in section A", () => {
+    const comments = Array.from({ length: 6 }, (_, index) => ({
+      ...comment,
+      commentId: `keyword-${index + 1}`,
+      text: index === 0 ? "Full course!!!" : "full course",
+      authorChannelId: `viewer-${index + 1}`,
+      creatorReplied: index < 2,
+    }));
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments,
+      classifications: comments.map((entry) => ({
+        commentId: entry.commentId,
+        category: "keyword_response" as const,
+        quote: entry.text,
+      })),
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain(
+      "6 viewers commented 'full course'; the creator replied to 2 of them",
+    );
+    expect(report.markdown).toContain("4 unanswered comments");
+    expect(report.markdown).toContain("keyword-3");
+    expect(report.markdown).not.toContain("keyword-1");
+    expect(report.markdown).not.toContain("keyword-2");
+    expect(report.sectionItemCounts.money).toBe(1);
+    expect(report.html).toContain("Keyword response: full course");
+  });
+
+  it("uses comment-derived grouped titles, shows three quotes, and reports remaining counts", () => {
+    const howToTexts = [
+      "How do I access the prompt for channel members?",
+      "How can I access the prompt for channel members?",
+      "How do we access the prompt for channel members?",
+      "How to access the prompt for channel members?",
+    ];
+    const complaints = [
+      "The prompt access is confusing for members.",
+      "Prompt access is broken for members.",
+      "Members cannot access the prompt.",
+      "Prompt access is confusing for channel members.",
+    ];
+    const comments = [...howToTexts, ...complaints].map((text, index) => ({
+      ...comment,
+      commentId: `group-${index + 1}`,
+      text,
+      authorChannelId: `viewer-${index + 1}`,
+      creatorReplied: index < 4,
+      creatorReplyId: `group-${index + 1}.reply`,
+    }));
+    const classifications = comments.map((entry, index) => ({
+      commentId: entry.commentId,
+      category:
+        index < 4
+          ? ("how_to_question" as const)
+          : ("complaint_or_objection" as const),
+      quote: entry.text,
+    }));
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments,
+      classifications,
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain(
+      "**Access The Prompt For Channel Members**",
+    );
+    expect(report.markdown).toContain("4 comments");
+    expect(report.markdown).toContain("and 1 more");
+    expect(report.markdown).not.toContain(
+      "Question that could inspire an idea",
+    );
+    expect(report.markdown).toContain(
+      "**Prompt Access Is Confusing For Members**",
+    );
+    expect(report.markdown).toContain("4 answered comments");
+    expect(report.html).toContain("Access The Prompt For Channel Members");
+    expect(report.html).toContain("and 1 more");
+  });
+
+  it("labels response guidance as suggestions and never includes model promises", () => {
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [comment],
+      classifications: [
+        {
+          commentId: "c1",
+          category: "buying_or_sponsor_inquiry",
+          quote: comment.text,
+          draftReply: "I'll send you a discount tomorrow.",
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain(
+      "Suggestions only — not a reply to post.",
+    );
+    expect(report.markdown).toContain("Points to cover:");
+    expect(report.markdown).not.toContain("I'll send you a discount tomorrow");
+    expect(report.markdown).not.toContain("I’ll share more details");
+    expect(report.html).toContain("Suggestions only");
+  });
+
+  it("truncates long quotes at a word boundary and adds an ellipsis", () => {
+    const longText = `${"word ".repeat(70)}tail text after limit`;
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [{ ...comment, text: longText }],
+      classifications: [{ commentId: "c1", category: "praise", quote: "bad" }],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const quote = report.verifiedClassifications[0]?.quote ?? "";
+    expect(quote.length).toBeLessThanOrEqual(300);
+    expect(quote).toMatch(/word…$/);
+    expect(quote).not.toContain("tail");
   });
 });
 

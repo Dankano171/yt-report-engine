@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isLowInformationComment } from "./classification.js";
+import { isLowInformationComment, truncateQuote } from "./classification.js";
 import { QuotaError, redactSecrets } from "./errors.js";
 import { readUsage } from "./storage.js";
 import type {
@@ -220,7 +220,7 @@ function mapCategory(value: string): Category | undefined {
 }
 
 function sourceQuote(comment: CommentRecord): string {
-  return comment.text.trim().slice(0, 300);
+  return truncateQuote(comment.text);
 }
 
 function parseModelJson(text: string): unknown {
@@ -692,10 +692,6 @@ function mockClassifications(comments: CommentRecord[]): ClassificationResult {
       commentId: comment.commentId,
       category,
       quote: sourceQuote(comment),
-      ...(category === "how_to_question" ||
-      category === "buying_or_sponsor_inquiry"
-        ? { draftReply: "Thanks for asking! I’ll share more details soon." }
-        : {}),
       ...(category === "topic_request" ? { idea: comment.text } : {}),
     };
   });

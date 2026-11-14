@@ -12,7 +12,8 @@ export type Category =
   | "alternative_or_tool_request"
   | "format_request"
   | "praise"
-  | "spam_or_noise";
+  | "spam_or_noise"
+  | "keyword_response";
 
 export interface ChannelConfig {
   handle?: string;
