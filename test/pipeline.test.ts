@@ -25,7 +25,7 @@ const config: AppConfig = {
   channels: [channel],
 };
 
-function fetcher(commentCount = 1): Fetcher {
+function fetcher(commentCount = 1, texts?: string[]): Fetcher {
   return async (input) => {
     const endpoint = new URL(String(input)).pathname.split("/").at(-1);
     const data: Record<string, unknown> = {
@@ -70,9 +70,10 @@ function fetcher(commentCount = 1): Fetcher {
             id: `comment${index + 1}`,
             snippet: {
               textOriginal:
-                index === 0
+                texts?.[index] ??
+                (index === 0
                   ? "How do I set this up?"
-                  : `How do I set this up ${index + 1}?`,
+                  : `How do I set this up ${index + 1}?`),
               likeCount: 8,
               publishedAt: "2026-03-11T12:00:00Z",
               authorChannelId: { value: "UCviewer" },
@@ -104,6 +105,35 @@ function partiallyClassifyingFetcher(
             })),
           )
         : "[]";
+    return new Response(
+      JSON.stringify({ choices: [{ message: { content } }] }),
+      { status: 200 },
+    );
+  };
+}
+
+function categorizedFetcher(texts: string[], categories: string[]): Fetcher {
+  const youtubeFetcher = fetcher(texts.length, texts);
+  return async (input, init) => {
+    if (new URL(String(input)).hostname === "www.googleapis.com")
+      return youtubeFetcher(input, init);
+    const request = JSON.parse(String(init?.body)) as {
+      messages: { content: string }[];
+    };
+    const prompt = request.messages[0]?.content ?? "";
+    const dataStart = prompt.indexOf("COMMENT DATA START");
+    const dataEnd = prompt.indexOf("COMMENT DATA END");
+    const dataJsonStart = prompt.indexOf("\n", dataStart) + 1;
+    const suppliedComments = JSON.parse(
+      prompt.slice(dataJsonStart, dataEnd).trim(),
+    ) as { id: number }[];
+    const content = JSON.stringify(
+      suppliedComments.map(({ id }) => ({
+        id,
+        category: categories[id - 1],
+        timestamp: null,
+      })),
+    );
     return new Response(
       JSON.stringify({ choices: [{ message: { content } }] }),
       { status: 200 },
@@ -253,6 +283,77 @@ describe("run pipeline", () => {
       failureReason: "More than 30% of analyzed comments were unclassified.",
     });
     await expect(readFile(join(folder, "report.md"), "utf8")).rejects.toThrow();
+  });
+
+  it("classifies 20 comments into report sections using real categories and source quotes", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-20-comments-"));
+    process.env.YOUTUBE_API_KEY = "test-key";
+    process.env.LLM_API_KEY = "test-llm-key";
+    const texts = [
+      "How much does the course cost?",
+      "How do I connect the account?",
+      "What is the next setup step?",
+      "Please cover monthly budgeting.",
+      "This workflow is too expensive.",
+      "I saved two hours every week.",
+      "Please add French captions.",
+      "Could you compare another app?",
+      "Make a shorter version please.",
+      "Great walkthrough, very clear.",
+      ...Array.from(
+        { length: 10 },
+        (_, index) => `How can I apply lesson ${index + 1}?`,
+      ),
+    ];
+    const categories = [
+      "buying_or_sponsor_inquiry",
+      "how_to_question",
+      "question",
+      "request",
+      "complaint",
+      "testimonial",
+      "language_or_subtitles_request",
+      "alternative_or_tool_request",
+      "format_request",
+      "praise",
+      ...Array.from({ length: 10 }, () => "how_to_question"),
+    ];
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const result = await runChannel({
+      channel,
+      config: { ...config, provider: "openai", model: "test-model" },
+      days: 30,
+      send: false,
+      debug: true,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: categorizedFetcher(texts, categories),
+      wait: async () => {},
+    });
+    expect(result.stats.unclassified).toBe(0);
+    expect(result.stats.classificationsByCategory).toMatchObject({
+      buying_or_sponsor_inquiry: 1,
+      how_to_question: 12,
+      complaint_or_objection: 1,
+      testimonial_or_result: 1,
+      topic_request: 1,
+    });
+    expect(result.stats.reportItemsBySection.money).toBeGreaterThan(0);
+    expect(result.stats.reportItemsBySection.ideas).toBeGreaterThan(0);
+    expect(result.stats.reportItemsBySection.fixes).toBeGreaterThan(0);
+    expect(result.stats.reportItemsBySection.proofs).toBeGreaterThan(0);
+    const debugOutput = log.mock.calls.map(([line]) => String(line)).join("\n");
+    expect(debugOutput).toContain('"rawCategoryHistogram"');
+    expect(debugOutput).toContain('"mappedCategoryHistogram"');
+    expect(debugOutput).toContain('"unmappedCount":0');
+    expect(debugOutput).not.toContain(texts[0]);
+    const markdown = await readFile(
+      join(result.reportFolder, "report.md"),
+      "utf8",
+    );
+    expect(markdown).toContain(texts[0]);
   });
 
   it("saves failed-batch stats and aborts instead of writing an empty report", async () => {

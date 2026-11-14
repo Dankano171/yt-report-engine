@@ -233,51 +233,6 @@ function groupFindings(findings: Finding[]): FindingGroup[] {
     .sort((left, right) => right.viewers - left.viewers);
 }
 
-function normalizeForQuoteMatch(text: string): string {
-  const namedEntities: Record<string, string> = {
-    amp: "&",
-    apos: "'",
-    bull: "•",
-    copy: "©",
-    eacute: "é",
-    Eacute: "É",
-    egrave: "è",
-    Egrave: "È",
-    gt: ">",
-    hellip: "…",
-    ldquo: "“",
-    lsquo: "‘",
-    lt: "<",
-    mdash: "—",
-    ndash: "–",
-    nbsp: " ",
-    quot: '"',
-    rdquo: "”",
-    reg: "®",
-    rsquo: "’",
-    trade: "™",
-  };
-  return text
-    .replace(/&(#(?:x[\da-f]+|\d+)|[a-z]+);/gi, (entity, value: string) => {
-      if (value.startsWith("#")) {
-        const hex = value[1]?.toLowerCase() === "x";
-        const codePoint = Number.parseInt(
-          value.slice(hex ? 2 : 1),
-          hex ? 16 : 10,
-        );
-        return Number.isFinite(codePoint) && codePoint <= 0x10ffff
-          ? String.fromCodePoint(codePoint)
-          : entity;
-      }
-      return (
-        namedEntities[value] ?? namedEntities[value.toLowerCase()] ?? entity
-      );
-    })
-    .normalize("NFKC")
-    .replace(/\s+/gu, " ")
-    .trim();
-}
-
 function findingList(input: ReportInput): {
   findings: Finding[];
   droppedQuotes: RenderedReport["droppedQuotes"];
@@ -303,21 +258,6 @@ function findingList(input: ReportInput): {
       continue;
     }
     if (isLowInformationComment(comment.text)) continue;
-    const quote = normalizeForQuoteMatch(classification.quote);
-    if (!quote) {
-      droppedQuotes.emptyQuote += 1;
-      console.warn(
-        `Dropping empty quote for comment ${classification.commentId}.`,
-      );
-      continue;
-    }
-    if (!normalizeForQuoteMatch(comment.text).includes(quote)) {
-      droppedQuotes.quoteNotFound += 1;
-      console.warn(
-        `Dropping non-verbatim quote for comment ${classification.commentId}.`,
-      );
-      continue;
-    }
     const video = videos.get(comment.videoId);
     if (!video) {
       droppedQuotes.missingVideo += 1;
@@ -327,7 +267,10 @@ function findingList(input: ReportInput): {
       continue;
     }
     findings.push({
-      classification,
+      classification: {
+        ...classification,
+        quote: comment.text.trim().slice(0, 300),
+      },
       comment,
       video,
       link: buildDeepLink(comment.videoId, comment.commentId),

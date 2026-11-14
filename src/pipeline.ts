@@ -154,6 +154,9 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
                 duplicateCount: event.duplicateCount ?? 0,
                 unknownIdCount: event.unknownIdCount ?? 0,
                 firstRawIds: event.firstRawIds ?? [],
+                rawCategoryHistogram: event.rawCategoryHistogram ?? {},
+                mappedCategoryHistogram: event.mappedCategoryHistogram ?? {},
+                unmappedCount: event.unmappedCount ?? 0,
                 finishReason: event.finishReason ?? null,
                 promptFeedbackBlockReason:
                   event.promptFeedbackBlockReason ?? null,
