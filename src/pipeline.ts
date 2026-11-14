@@ -34,6 +34,7 @@ export interface RunStats {
   videosAnalyzed: number;
   commentsFetched: number;
   commentsSentToLlm: number;
+  unclassified: number;
   classificationSucceeded: boolean;
   failureReason?: string;
   classifyOnly?: boolean;
@@ -149,6 +150,10 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
                 commentsSent: event.commentsSent ?? 0,
                 itemsReturned: event.itemsReturned ?? 0,
                 itemsValid: event.itemsValid ?? 0,
+                missingCount: event.missingCount ?? 0,
+                duplicateCount: event.duplicateCount ?? 0,
+                unknownIdCount: event.unknownIdCount ?? 0,
+                firstRawIds: event.firstRawIds ?? [],
                 finishReason: event.finishReason ?? null,
                 promptFeedbackBlockReason:
                   event.promptFeedbackBlockReason ?? null,
@@ -172,6 +177,12 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
       .slice(0, 10),
     to: now.toISOString().slice(0, 10),
   };
+  const unclassifiedRatio =
+    analysisComments.length > 0
+      ? analysis.unclassifiedCount / analysisComments.length
+      : 0;
+  const exceedsUnclassifiedThreshold = unclassifiedRatio > 0.3;
+  const unclassifiedReason = `${analysis.unclassifiedCount} of ${analysisComments.length} analyzed comments remained unclassified after retry.`;
   console.log("Verifying quotes.");
   const rendered = renderReport({
     channel: options.channel,
@@ -180,11 +191,15 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     classifications: analysis.classifications,
     dateRange: range,
     classificationSucceeded: analysis.classificationSucceeded,
-    ...(analysis.stoppedReason || analysis.failedBatches.length > 0
+    ...(analysis.stoppedReason ||
+    analysis.unclassifiedCount > 0 ||
+    analysis.failedBatches.length > 0
       ? {
           stoppedReason:
             analysis.stoppedReason ??
-            `${analysis.failedBatches.length} classification batch(es) failed after retry; see stats.json.`,
+            (analysis.unclassifiedCount > 0
+              ? unclassifiedReason
+              : `${analysis.failedBatches.length} classification batch(es) failed after retry; see stats.json.`),
         }
       : {}),
   });
@@ -209,29 +224,24 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   };
   for (const classification of analysis.classifications)
     classificationsByCategory[classification.category] += 1;
-  const classifiedCount = Object.values(classificationsByCategory).reduce(
-    (total, count) => total + count,
-    0,
-  );
-  const zeroClassifications =
-    analysis.commentsSentToLlm > 0 && classifiedCount === 0;
-  const zeroClassificationReason =
-    "No comments were classified despite sending comments to the LLM.";
   const stats: RunStats = {
     date: now.toISOString().slice(0, 10),
     videosAnalyzed: data.videos.length,
     commentsFetched: data.comments.length,
     commentsSentToLlm: analysis.commentsSentToLlm,
-    classificationSucceeded:
-      analysis.classificationSucceeded && !zeroClassifications,
-    ...(zeroClassifications
+    unclassified: analysis.unclassifiedCount,
+    classificationSucceeded: analysis.classificationSucceeded,
+    ...(exceedsUnclassifiedThreshold
       ? {
-          stoppedReason: zeroClassificationReason,
-          failureReason: zeroClassificationReason,
+          stoppedReason: unclassifiedReason,
+          failureReason:
+            "More than 30% of analyzed comments were unclassified.",
         }
       : analysis.stoppedReason
         ? { stoppedReason: analysis.stoppedReason }
-        : {}),
+        : analysis.unclassifiedCount > 0
+          ? { stoppedReason: unclassifiedReason }
+          : {}),
     ...(options.classifyOnly ? { classifyOnly: true } : {}),
     batches: {
       total: analysis.batchCount,
@@ -256,17 +266,9 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   };
   await appendUsage(usage, options.usagePath);
   printRunSummary(stats);
-  if (zeroClassifications) {
+  if (exceedsUnclassifiedThreshold) {
     throw new Error(
-      `${zeroClassificationReason} Stats were saved to ${resolve(folder, "stats.json")}; no report was produced.`,
-    );
-  }
-  const totalFailures = analysis.failedBatches.length;
-  const exceedsFailureThreshold =
-    analysis.batchCount > 0 && totalFailures / analysis.batchCount > 0.3;
-  if (exceedsFailureThreshold) {
-    throw new Error(
-      `Analysis failed for ${totalFailures} of ${analysis.batchCount} batches (>30%). Stats were saved to ${resolve(folder, "stats.json")}; no report was produced.`,
+      `${unclassifiedReason} More than 30% is unclassified; stats were saved to ${resolve(folder, "stats.json")}; no report was produced.`,
     );
   }
   if (options.classifyOnly) {
@@ -331,6 +333,7 @@ function printRunSummary(stats: RunStats): void {
   console.log(`  Videos analyzed: ${stats.videosAnalyzed}`);
   console.log(`  Comments fetched: ${stats.commentsFetched}`);
   console.log(`  Comments sent to the LLM: ${stats.commentsSentToLlm}`);
+  console.log(`  Comments unclassified: ${stats.unclassified}`);
   console.log(
     `  Classification status: ${stats.classificationSucceeded ? "complete" : "incomplete"}${stats.stoppedReason ? ` (${stats.stoppedReason})` : ""}`,
   );

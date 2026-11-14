@@ -58,6 +58,12 @@ const video: VideoRecord = {
   durationSeconds: 100,
 };
 
+function openAiResponse(content: string): Response {
+  return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+    status: 200,
+  });
+}
+
 describe("comment analysis safety", () => {
   it("clearly delimits untrusted comments and instructs the model to ignore embedded instructions", () => {
     const prompt = buildClassificationPrompt([comment]);
@@ -106,15 +112,9 @@ describe("comment analysis safety", () => {
             choices: [
               {
                 message: {
-                  content: JSON.stringify({
-                    classifications: [
-                      {
-                        commentId: "c1",
-                        category: "how_to_question",
-                        quote: "How do I use this?",
-                      },
-                    ],
-                  }),
+                  content: JSON.stringify([
+                    { id: 1, category: "how_to_question", timestamp: null },
+                  ]),
                 },
               },
             ],
@@ -135,7 +135,7 @@ describe("comment analysis safety", () => {
     expect(result.successfulBatches).toBe(1);
   });
 
-  it("fails and retries when a non-empty batch returns no classifications", async () => {
+  it("retries when a non-empty batch returns no classifications", async () => {
     const events: { outcome: string; itemsReturned?: number }[] = [];
     let calls = 0;
     const result = await analyzeComments([comment], {
@@ -149,7 +149,7 @@ describe("comment analysis safety", () => {
         calls += 1;
         return new Response(
           JSON.stringify({
-            choices: [{ message: { content: '{"classifications":[]}' } }],
+            choices: [{ message: { content: "[]" } }],
           }),
           { status: 200 },
         );
@@ -159,6 +159,7 @@ describe("comment analysis safety", () => {
     expect(calls).toBe(2);
     expect(result.classifications).toEqual([]);
     expect(result.successfulBatches).toBe(0);
+    expect(result.unclassifiedCount).toBe(1);
     expect(result.failedBatches).toEqual([
       { batch: 1, reason: "coverage_failure" },
     ]);
@@ -166,15 +167,29 @@ describe("comment analysis safety", () => {
       "coverage_failure",
       "coverage_failure",
     ]);
-    expect(events.map((event) => event.itemsReturned)).toEqual([0, 0]);
+    expect(events.map((event) => event.missingCount)).toEqual([1, 1]);
   });
 
-  it("retries missing IDs with the expected IDs in the stricter prompt", async () => {
+  it("maps short integer IDs and retries only missing comments with new indexes", async () => {
     const prompts: string[] = [];
-    const result = await analyzeComments([comment], {
+    const comments = [
+      { ...comment, commentId: "yt-comment-id-long-111111111111111" },
+      {
+        ...comment,
+        commentId: "yt-comment-id-long-222222222222222",
+        text: "How do I install this?",
+      },
+      {
+        ...comment,
+        commentId: "yt-comment-id-long-333333333333333",
+        text: "Can this work on mobile?",
+      },
+    ];
+    const result = await analyzeComments(comments, {
       provider: "openai",
       model: "test-model",
       apiKey: "test-key",
+      batchSize: 3,
       maxUsdPerRun: 1,
       maxUsdPerDay: 1,
       dailyUsage: [],
@@ -183,34 +198,111 @@ describe("comment analysis safety", () => {
           messages: { content: string }[];
         };
         prompts.push(request.messages[0]?.content ?? "");
-        const commentId = prompts.length === 1 ? "unknown" : "c1";
-        return new Response(
-          JSON.stringify({
-            choices: [
-              {
-                message: {
-                  content: JSON.stringify({
-                    classifications: [
-                      {
-                        commentId,
-                        category: "how_to_question",
-                        quote: "How do I use this?",
-                      },
-                    ],
-                  }),
-                },
-              },
-            ],
-          }),
-          { status: 200 },
+        if (prompts.length === 1)
+          return openAiResponse(
+            JSON.stringify([
+              { id: 1, category: "how_to_question", timestamp: null },
+              { id: 3, category: "praise", timestamp: null },
+            ]),
+          );
+        return openAiResponse(
+          JSON.stringify([
+            { id: " 1 ", category: "confusion_or_error", timestamp: null },
+          ]),
         );
       },
     });
     expect(prompts).toHaveLength(2);
-    expect(prompts[1]).toContain('Expected IDs: ["c1"]');
+    for (const prompt of prompts) {
+      expect(prompt).not.toContain("yt-comment-id-long-");
+      expect(prompt).not.toContain('"commentId"');
+    }
+    expect(prompts[0]).toContain('"id":1');
+    expect(prompts[0]).toContain('"id":2');
+    expect(prompts[0]).toContain('"id":3');
+    expect(prompts[1]).toContain("How do I install this?");
+    expect(prompts[1]).not.toContain("How do I use this?");
+    expect(prompts[1]).not.toContain("Can this work on mobile?");
+    expect(prompts[1]).toContain("Expected ids: [1]");
+    expect(result.classifications.map((item) => item.commentId)).toEqual([
+      "yt-comment-id-long-111111111111111",
+      "yt-comment-id-long-333333333333333",
+      "yt-comment-id-long-222222222222222",
+    ]);
     expect(result.failedBatches).toEqual([]);
-    expect(result.classifications).toHaveLength(1);
+    expect(result.classifications).toHaveLength(3);
     expect(result.successfulBatches).toBe(1);
+  });
+
+  it("accepts fenced JSON with numeric strings and unknown extra fields", async () => {
+    const result = await analyzeComments([comment], {
+      provider: "openai",
+      model: "test-model",
+      apiKey: "test-key",
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async () =>
+        openAiResponse(
+          '```json\n[{"id":" 1 ","category":"how_to_question","timestamp":null,"extra":"ignored"}]\n```',
+        ),
+    });
+    expect(result.classifications).toMatchObject([
+      { commentId: "c1", category: "how_to_question" },
+    ]);
+    expect(result.unclassifiedCount).toBe(0);
+  });
+
+  it("counts duplicate and unknown indexes and retries the missing comment", async () => {
+    const events: {
+      itemsValid?: number;
+      missingCount?: number;
+      duplicateCount?: number;
+      unknownIdCount?: number;
+      firstRawIds?: (number | string | null)[];
+    }[] = [];
+    let calls = 0;
+    const second = {
+      ...comment,
+      commentId: "second-youtube-id",
+      text: "How can I set this up?",
+    };
+    const result = await analyzeComments([comment, second], {
+      provider: "openai",
+      model: "test-model",
+      apiKey: "test-key",
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async () => {
+        calls += 1;
+        if (calls === 1)
+          return openAiResponse(
+            JSON.stringify([
+              { id: 1, category: "how_to_question" },
+              { id: 1, category: "praise" },
+              { id: 9, category: "praise" },
+            ]),
+          );
+        return openAiResponse(
+          JSON.stringify([{ id: 1, category: "how_to_question" }]),
+        );
+      },
+      onBatchEvent: (event) => events.push(event),
+    });
+    expect(calls).toBe(2);
+    expect(events[0]).toMatchObject({
+      itemsValid: 1,
+      missingCount: 1,
+      duplicateCount: 1,
+      unknownIdCount: 1,
+      firstRawIds: [1, 1, 9],
+    });
+    expect(result.classifications.map((item) => item.commentId)).toEqual([
+      "c1",
+      "second-youtube-id",
+    ]);
+    expect(result.unclassifiedCount).toBe(0);
   });
 
   it("retries MAX_TOKENS responses with smaller comment chunks", async () => {
@@ -269,7 +361,6 @@ describe("comment analysis safety", () => {
               { status: 200 },
             );
           }
-          const commentId = prompt.includes('"commentId":"c1"') ? "c1" : "c2";
           return new Response(
             JSON.stringify({
               candidates: [
@@ -278,18 +369,13 @@ describe("comment analysis safety", () => {
                   content: {
                     parts: [
                       {
-                        text: JSON.stringify({
-                          classifications: [
-                            {
-                              commentId,
-                              category: "how_to_question",
-                              quote:
-                                commentId === "c1"
-                                  ? "How do I use this?"
-                                  : "How can I configure this?",
-                            },
-                          ],
-                        }),
+                        text: JSON.stringify([
+                          {
+                            id: 1,
+                            category: "how_to_question",
+                            timestamp: null,
+                          },
+                        ]),
                       },
                     ],
                   },
@@ -309,9 +395,9 @@ describe("comment analysis safety", () => {
       },
     );
     expect(prompts).toHaveLength(3);
-    expect(prompts[1]).toContain('"commentId":"c1"');
-    expect(prompts[1]).not.toContain('"commentId":"c2"');
-    expect(prompts[2]).toContain('"commentId":"c2"');
+    expect(prompts[1]).toContain("How do I use this?");
+    expect(prompts[1]).not.toContain("How can I configure this?");
+    expect(prompts[2]).toContain("How can I configure this?");
     expect(result.classifications).toHaveLength(2);
     expect(result.failedBatches).toEqual([]);
     expect(events[0]).toMatchObject({
@@ -357,8 +443,6 @@ describe("comment analysis safety", () => {
             }),
             { status: 400 },
           );
-        const secondCommentRequested =
-          request.contents[0]?.parts[0]?.text.includes('"commentId":"c2"');
         return new Response(
           JSON.stringify({
             candidates: [
@@ -367,17 +451,13 @@ describe("comment analysis safety", () => {
                 content: {
                   parts: [
                     {
-                      text: JSON.stringify({
-                        classifications: [
-                          {
-                            commentId: secondCommentRequested ? "c2" : "c1",
-                            category: "how_to_question",
-                            quote: secondCommentRequested
-                              ? "How can I configure this?"
-                              : "How do I use this?",
-                          },
-                        ],
-                      }),
+                      text: JSON.stringify([
+                        {
+                          id: 1,
+                          category: "how_to_question",
+                          timestamp: null,
+                        },
+                      ]),
                     },
                   ],
                 },
@@ -456,15 +536,9 @@ describe("comment analysis safety", () => {
             choices: [
               {
                 message: {
-                  content: JSON.stringify({
-                    classifications: [
-                      {
-                        commentId: "c1",
-                        category: "how_to_question",
-                        quote: "How do I use this?",
-                      },
-                    ],
-                  }),
+                  content: JSON.stringify([
+                    { id: 1, category: "how_to_question", timestamp: null },
+                  ]),
                 },
               },
             ],
