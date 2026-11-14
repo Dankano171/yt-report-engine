@@ -10,6 +10,7 @@ import {
   clusterReportSections,
   renderReport,
   type ReportClusters,
+  type ReportSection,
 } from "./report.js";
 import { appendUsage, cacheComments, readUsage } from "./storage.js";
 import { fetchChannelData } from "./youtube.js";
@@ -71,6 +72,20 @@ export interface RunStats {
     proofs: number;
     answered: number;
   };
+  reportDestinationCounts: {
+    money: number;
+    ideas: number;
+    fixes: number;
+    proofs: number;
+    answered: number;
+    noise: number;
+    keywordGroup: number;
+    purchaseIntent: number;
+    praise: number;
+  };
+  titleFallbacks: Partial<
+    Record<ReportSection, { count: number; reason: string }>
+  >;
   droppedQuotes: {
     emptyQuote: number;
     quoteNotFound: number;
@@ -111,6 +126,7 @@ function emptyCategoryCounts(): Record<Category, number> {
     keyword_response: 0,
     suspected_bot_or_promo: 0,
     purchase_intent: 0,
+    mentoring_or_personal_request: 0,
   };
 }
 
@@ -233,6 +249,18 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
         proofs: 0,
         answered: 0,
       },
+      reportDestinationCounts: {
+        money: 0,
+        ideas: 0,
+        fixes: 0,
+        proofs: 0,
+        answered: 0,
+        noise: 0,
+        keywordGroup: 0,
+        purchaseIntent: 0,
+        praise: 0,
+      },
+      titleFallbacks: {},
       droppedQuotes: {
         emptyQuote: 0,
         quoteNotFound: 0,
@@ -464,6 +492,14 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     );
   }
   const rendered = renderReport(reportInput, reportClusters);
+  if (options.debug) {
+    for (const [section, fallback] of Object.entries(rendered.titleFallbacks)) {
+      if (fallback)
+        console.log(
+          `Report title fallback: section=${section}, count=${fallback.count}, reason=${redactSecrets(fallback.reason)}.`,
+        );
+    }
+  }
   await mkdir(folder, { recursive: true });
   const classificationsByCategory = emptyCategoryCounts();
   for (const classification of classifications)
@@ -518,6 +554,8 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     },
     classificationsByCategory,
     reportItemsBySection: rendered.sectionItemCounts,
+    reportDestinationCounts: rendered.reportDestinationCounts,
+    titleFallbacks: rendered.titleFallbacks,
     droppedQuotes: rendered.droppedQuotes,
   };
   await writeFile(

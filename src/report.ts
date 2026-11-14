@@ -27,7 +27,14 @@ export interface ReportInput {
 
 export type ReportSection = "money" | "ideas" | "fixes" | "proofs" | "answered";
 export type ReportClusters = Partial<
-  Record<ReportSection, { clusters: WritingCluster[]; commentIds: string[] }>
+  Record<
+    ReportSection,
+    {
+      clusters: WritingCluster[];
+      commentIds: string[];
+      fallbackReason?: string;
+    }
+  >
 >;
 
 interface Finding {
@@ -48,6 +55,20 @@ export interface RenderedReport {
     proofs: number;
     answered: number;
   };
+  reportDestinationCounts: {
+    money: number;
+    ideas: number;
+    fixes: number;
+    proofs: number;
+    answered: number;
+    noise: number;
+    keywordGroup: number;
+    purchaseIntent: number;
+    praise: number;
+  };
+  titleFallbacks: Partial<
+    Record<ReportSection, { count: number; reason: string }>
+  >;
   droppedQuotes: {
     emptyQuote: number;
     quoteNotFound: number;
@@ -62,18 +83,11 @@ function escapeHtml(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;")
-    .replace(/&amp;(#(?:\d+|x[\da-f]+)|[a-z]+);/gi, "&$1;");
+    .replaceAll("'", "&#39;");
 }
 
 function escapeMarkdown(value: string): string {
-  return value
-    .replace(/[\s\S]/g, (character) =>
-      character === "\\" || "`*_{}()#+.!|>[][".includes(character)
-        ? `&#${character.codePointAt(0)};`
-        : character,
-    )
-    .replaceAll("\n", " ");
+  return value.replaceAll("\n", " ");
 }
 
 function quoteBlock(quote: string): string {
@@ -115,6 +129,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "keyword_response",
       "suspected_bot_or_promo",
       "purchase_intent",
+      "mentoring_or_personal_request",
     ],
     sell_tool: [
       "buying_or_sponsor_inquiry",
@@ -131,6 +146,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "keyword_response",
       "suspected_bot_or_promo",
       "purchase_intent",
+      "mentoring_or_personal_request",
     ],
     sponsorships: [
       "buying_or_sponsor_inquiry",
@@ -147,6 +163,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "keyword_response",
       "suspected_bot_or_promo",
       "purchase_intent",
+      "mentoring_or_personal_request",
     ],
     grow_audience: [
       "topic_request",
@@ -163,6 +180,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "keyword_response",
       "suspected_bot_or_promo",
       "purchase_intent",
+      "mentoring_or_personal_request",
     ],
   };
   return orders[channel.creatorGoal];
@@ -186,6 +204,60 @@ interface FindingGroup {
   viewers: number;
   title?: string;
   paraphrase?: string;
+  fallbackReason?: string;
+}
+
+const titleStopWords = new Set([
+  "about",
+  "after",
+  "again",
+  "also",
+  "because",
+  "been",
+  "being",
+  "could",
+  "from",
+  "have",
+  "help",
+  "here",
+  "into",
+  "just",
+  "like",
+  "more",
+  "please",
+  "should",
+  "that",
+  "them",
+  "then",
+  "there",
+  "they",
+  "this",
+  "what",
+  "when",
+  "where",
+  "which",
+  "with",
+  "would",
+  "your",
+]);
+
+function neutralCommentTitle(text: string): string {
+  const words = text.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [];
+  const counts = new Map<string, number>();
+  for (const word of words) {
+    if (!titleStopWords.has(word))
+      counts.set(word, (counts.get(word) ?? 0) + 1);
+  }
+  const keyWords = [...counts]
+    .sort(
+      ([left, leftCount], [right, rightCount]) =>
+        rightCount - leftCount || left.localeCompare(right),
+    )
+    .slice(0, 5)
+    .map(([word]) => word);
+  return keyWords.length
+    ? `Viewer comment about ${keyWords.join(" ")}`
+    : "General viewer feedback";
 }
 
 const requestCategories = new Set<Category>([
@@ -194,6 +266,7 @@ const requestCategories = new Set<Category>([
   "language_or_subtitles_request",
   "alternative_or_tool_request",
   "format_request",
+  "mentoring_or_personal_request",
 ]);
 
 function isActionableMoney(finding: Finding): boolean {
@@ -202,34 +275,23 @@ function isActionableMoney(finding: Finding): boolean {
     /\b(buy|purchase|access|price|pricing|cost|payment|paid|sponsor|partnership|refund|membership|password|login|account)\b/i.test(
       comment.text,
     );
-  const reportsProblem =
-    /\b(problem|issue|broken|can't|cannot|doesn't work|won't|asks? for|asked for|can't access|cannot access)\b/i.test(
-      comment.text,
-    );
   const asksQuestion =
     /[?]|\b(what|how|where|when|can|could|does|do|is|are|which|who)\b/i.test(
       comment.text,
     );
   return (
     !comment.creatorReplied &&
+    classification.category !== "mentoring_or_personal_request" &&
     (isCustomerProblem(finding) ||
       (classification.category === "buying_or_sponsor_inquiry" &&
-        topicNeedsCreatorAction &&
-        asksQuestion) ||
-      (classification.category === "how_to_question" &&
-        topicNeedsCreatorAction &&
-        asksQuestion) ||
-      ((classification.category === "confusion_or_error" ||
-        classification.category === "complaint_or_objection") &&
-        topicNeedsCreatorAction &&
-        reportsProblem))
+        (topicNeedsCreatorAction || asksQuestion)))
   );
 }
 
 function isCustomerProblem(finding: Finding): boolean {
   const text = finding.comment.text;
   const paidOrJoined =
-    /\b(paid|payment|purchased|bought|joined|membership|member level|subscription)\b/i.test(
+    /\b(paid|payment|purchased|bought|joined|subscribed|subscription)\b/i.test(
       text,
     );
   const deliveryOrAccessProblem =
@@ -259,8 +321,12 @@ function isFix(finding: Finding): boolean {
 function isAnsweredQuestion(finding: Finding): boolean {
   return (
     finding.comment.creatorReplied &&
-    (finding.classification.category === "how_to_question" ||
-      finding.classification.category === "buying_or_sponsor_inquiry")
+    finding.classification.category !== "spam_or_noise" &&
+    finding.classification.category !== "suspected_bot_or_promo" &&
+    finding.classification.category !== "keyword_response" &&
+    finding.classification.category !== "purchase_intent" &&
+    finding.classification.category !== "praise" &&
+    finding.classification.category !== "testimonial_or_result"
   );
 }
 
@@ -278,6 +344,7 @@ export async function clusterReportSections(
   now?: Date,
   onUsage?: (record: UsageRecord) => Promise<void>,
   reserveUsd?: (estimate: number) => boolean,
+  onFallback?: (section: ReportSection, reason: string) => void,
 ): Promise<ReportClusters> {
   const findings = findingList(input).findings;
   const moneyIds = new Set(
@@ -316,6 +383,7 @@ export async function clusterReportSections(
   for (const section of Object.keys(sectionComments) as ReportSection[]) {
     const comments = sectionComments[section];
     if (comments.length === 0) continue;
+    let fallbackReason: string | undefined;
     clusters[section] = {
       clusters: await clusterComments(comments, {
         provider: config.provider,
@@ -341,18 +409,16 @@ export async function clusterReportSections(
         ...(now ? { date: now.toISOString().slice(0, 10) } : {}),
         ...(onUsage ? { onUsage } : {}),
         ...(reserveUsd ? { reserveUsd } : {}),
+        onFallback: (reason) => {
+          fallbackReason = reason;
+          onFallback?.(section, reason);
+        },
       }),
       commentIds: comments.map((comment) => comment.commentId),
+      ...(fallbackReason ? { fallbackReason } : {}),
     };
   }
   return clusters;
-}
-
-function categoryTitle(category: Category): string {
-  return category
-    .split("_")
-    .map((word) => word[0]!.toLocaleUpperCase() + word.slice(1))
-    .join(" ");
 }
 
 function groupsForSection(
@@ -392,7 +458,9 @@ function groupsForSection(
     result.push({
       findings: [finding],
       viewers: 1,
-      title: categoryTitle(finding.classification.category),
+      title: neutralCommentTitle(finding.comment.text),
+      fallbackReason:
+        sectionData?.fallbackReason ?? "no validated writing-model title",
     });
   }
   return result;
@@ -538,15 +606,32 @@ function groundedParaphrase(group: FindingGroup): string | undefined {
     : undefined;
 }
 
+function sourceSnippet(source: string, words: string[]): string | undefined {
+  const sentences = source.match(/[^.!?\n]+[.!?]?/g) ?? [];
+  for (const sentence of sentences) {
+    const normalized = sentence.toLocaleLowerCase();
+    if (!words.some((word) => normalized.includes(word))) continue;
+    const trimmed = sentence.trim();
+    if (!trimmed) continue;
+    if (trimmed.length <= 120) return trimmed;
+    const prefix = trimmed.slice(0, 119);
+    const boundary = prefix.lastIndexOf(" ");
+    return `${prefix.slice(0, boundary > 0 ? boundary : prefix.length)}…`;
+  }
+  return undefined;
+}
+
 function answerSource(finding: Finding): string | undefined {
   const words =
     finding.comment.text.toLocaleLowerCase().match(/[\p{L}\p{N}]{4,}/gu) ?? [];
-  const description = finding.video.description.toLocaleLowerCase();
-  if (description.trim() && words.some((word) => description.includes(word)))
-    return "video description";
-  const reply = finding.comment.creatorReplyText?.toLocaleLowerCase() ?? "";
-  if (reply && words.some((word) => reply.includes(word)))
-    return "creator reply";
+  const description = finding.video.description;
+  const descriptionSnippet = sourceSnippet(description, words);
+  if (descriptionSnippet && description.includes(descriptionSnippet))
+    return `video description: “${descriptionSnippet}”`;
+  const reply = finding.comment.creatorReplyText ?? "";
+  const replySnippet = sourceSnippet(reply, words);
+  if (replySnippet && reply.includes(replySnippet))
+    return `creator reply: “${replySnippet}”`;
   return undefined;
 }
 
@@ -557,6 +642,8 @@ function renderMarkdown(
 ): {
   markdown: string;
   sectionItemCounts: RenderedReport["sectionItemCounts"];
+  reportDestinationCounts: RenderedReport["reportDestinationCounts"];
+  titleFallbacks: RenderedReport["titleFallbacks"];
 } {
   const videoNames = input.videos.length
     ? input.videos.map((video) => `“${escapeMarkdown(video.title)}”`).join(", ")
@@ -647,7 +734,7 @@ function renderMarkdown(
           classification.category === "testimonial_or_result",
       ),
       input,
-    ).slice(0, 5),
+    ),
     "proofs",
     clusters,
   );
@@ -685,7 +772,8 @@ function renderMarkdown(
       category === "topic_request" ||
       category === "language_or_subtitles_request" ||
       category === "alternative_or_tool_request" ||
-      category === "format_request"
+      category === "format_request" ||
+      category === "mentoring_or_personal_request"
     )
       quickPulseCounts.requests += 1;
     if (category === "complaint_or_objection") quickPulseCounts.objections += 1;
@@ -810,6 +898,71 @@ function renderMarkdown(
     proofs: proofs.length,
     answered: answeredItems.length,
   };
+  const reportDestinationCounts: RenderedReport["reportDestinationCounts"] = {
+    money: 0,
+    ideas: 0,
+    fixes: 0,
+    proofs: 0,
+    answered: 0,
+    noise: 0,
+    keywordGroup: 0,
+    purchaseIntent: 0,
+    praise: 0,
+  };
+  const findingById = new Map(
+    findings.map((finding) => [finding.comment.commentId, finding]),
+  );
+  const commentById = new Map(
+    input.comments.map((comment) => [comment.commentId, comment]),
+  );
+  for (const classification of input.classifications) {
+    const comment = commentById.get(classification.commentId);
+    if (!comment) continue;
+    if (
+      isLowInformationComment(comment.text) ||
+      classification.category === "spam_or_noise" ||
+      classification.category === "suspected_bot_or_promo"
+    ) {
+      reportDestinationCounts.noise += 1;
+    } else if (classification.category === "keyword_response") {
+      reportDestinationCounts.keywordGroup += 1;
+    } else if (classification.category === "purchase_intent") {
+      reportDestinationCounts.purchaseIntent += 1;
+    } else if (classification.category === "praise") {
+      reportDestinationCounts.praise += 1;
+    } else if (classification.category === "testimonial_or_result") {
+      reportDestinationCounts.proofs += 1;
+    } else {
+      const finding = findingById.get(classification.commentId);
+      if (!finding) continue;
+      if (isAnsweredQuestion(finding)) reportDestinationCounts.answered += 1;
+      else if (isActionableMoney(finding)) reportDestinationCounts.money += 1;
+      else if (isUnansweredRequest(finding)) reportDestinationCounts.ideas += 1;
+      else if (isFix(finding)) reportDestinationCounts.fixes += 1;
+      else reportDestinationCounts.ideas += 1;
+    }
+  }
+  const titleFallbacks: RenderedReport["titleFallbacks"] = {};
+  const fallbackGroups: [ReportSection, FindingGroup[]][] = [
+    ["money", otherMoneyGroups],
+    ["ideas", requests],
+    ["fixes", fixes],
+    ["proofs", proofs],
+    ["answered", answeredQuestions],
+  ];
+  for (const [section, groups] of fallbackGroups) {
+    const fallbackGroupsInSection = groups.filter(
+      (group) => group.fallbackReason,
+    );
+    if (fallbackGroupsInSection.length > 0) {
+      titleFallbacks[section] = {
+        count: fallbackGroupsInSection.length,
+        reason:
+          clusters[section]?.fallbackReason ??
+          fallbackGroupsInSection[0]!.fallbackReason!,
+      };
+    }
+  }
   const incompleteMessage =
     "_Not reported because classification did not complete successfully._";
   const enough = input.videos.length > 0 || input.comments.length > 0;
@@ -828,10 +981,12 @@ function renderMarkdown(
     `- Noise: ${share(quickPulseCounts.noise)}`,
     `- Suspected bot/promo: ${share(quickPulseCounts.botOrPromo)}`,
     `- Purchase intent: ${share(quickPulseCounts.purchaseIntent)}`,
-    ...keywordResponseGroups.map(
-      (group) =>
-        `- ${group.viewers} viewers commented a '${escapeMarkdown(group.phrase)}' variant; the creator replied to ${group.findings.filter((finding) => finding.comment.creatorReplied).length}`,
-    ),
+    ...keywordResponseGroups.map((group) => {
+      const repliedCount = group.findings.filter(
+        (finding) => finding.comment.creatorReplied,
+      ).length;
+      return `- ${viewerLabel(group.viewers)} commented a '${escapeMarkdown(group.phrase)}' variant; the creator replied to ${repliedCount}`;
+    }),
     `- Creator replied: ${share(input.comments.filter((comment) => comment.creatorReplied).length)}`,
     input.classificationSucceeded === false
       ? "_Classification incomplete; category shares may be partial._"
@@ -863,7 +1018,7 @@ function renderMarkdown(
       ? proofs
           .map(
             (group) =>
-              `- **${cleanTitle(group.title ?? "Testimonial or result")}**\n\n${group.findings
+              `- ${group.findings.length} proof comment${group.findings.length === 1 ? "" : "s"}${group.findings.length > 3 ? `; and ${group.findings.length - 3} more` : ""}\n\n${group.findings
                 .slice(0, 3)
                 .map(markdownFinding)
                 .join("\n\n")}`,
@@ -892,6 +1047,8 @@ function renderMarkdown(
   return {
     markdown: sections.filter((section) => section !== "").join("\n"),
     sectionItemCounts,
+    reportDestinationCounts,
+    titleFallbacks,
   };
 }
 
@@ -920,10 +1077,7 @@ function markdownToHtml(markdown: string): string {
     output += inlineHtml(value.slice(start));
     return output
       .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-      .replace(/\*(.+?)\*/g, "<em>$1</em>")
-      .replace(/\\([\\`*_{}()#+.!|>])/g, "$1")
-      .replaceAll("\\[", "[")
-      .replaceAll("\\]", "]");
+      .replace(/\*(.+?)\*/g, "<em>$1</em>");
   };
   const lines = markdown.split("\n");
   const output: string[] = [];
@@ -995,6 +1149,8 @@ export function renderReport(
       (finding) => finding.classification,
     ),
     sectionItemCounts: rendered.sectionItemCounts,
+    reportDestinationCounts: rendered.reportDestinationCounts,
+    titleFallbacks: rendered.titleFallbacks,
     droppedQuotes: verification.droppedQuotes,
   };
 }

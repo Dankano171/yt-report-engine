@@ -15,7 +15,8 @@ export type Category =
   | "spam_or_noise"
   | "keyword_response"
   | "suspected_bot_or_promo"
-  | "purchase_intent";
+  | "purchase_intent"
+  | "mentoring_or_personal_request";
 
 export interface ChannelConfig {
   handle?: string;

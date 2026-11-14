@@ -170,6 +170,7 @@ describe("comment analysis safety", () => {
 
   it("rejects unknown and duplicate cluster IDs after one retry", async () => {
     let calls = 0;
+    let fallbackReason = "";
     const fetcher: Fetcher = async () => {
       calls += 1;
       return openAiResponse(
@@ -188,7 +189,15 @@ describe("comment analysis safety", () => {
       fetcher,
       section: "fixes",
     } as const;
-    await expect(clusterComments([comment], options)).resolves.toEqual([]);
+    await expect(
+      clusterComments([comment], {
+        ...options,
+        onFallback: (reason) => {
+          fallbackReason = reason;
+        },
+      }),
+    ).resolves.toEqual([]);
+    expect(fallbackReason).toContain("retry exhausted");
     await expect(clusterComments([comment], options)).resolves.toEqual([]);
     expect(calls).toBe(4);
   });
@@ -1067,7 +1076,7 @@ describe("report generation", () => {
     });
     expect(report.markdown).toContain("## C. Fix list");
     expect(report.markdown).toContain(
-      "**Complaint Or Objection** — 1 viewer (single mention) · 1 comment",
+      "**Viewer comment about bull markets only strategy works** — 1 viewer (single mention) · 1 comment",
     );
     expect(report.markdown).toContain(objection);
   });
@@ -1164,7 +1173,7 @@ describe("report generation", () => {
     );
   });
 
-  it("uses category fallbacks and leaves comments ungrouped when no clusters are available", () => {
+  it("uses neutral paraphrase titles and records fallback reasons when clusters are unavailable", () => {
     const howToTexts = [
       "How do I access the prompt for channel members?",
       "How can I access the prompt for channel members?",
@@ -1200,14 +1209,19 @@ describe("report generation", () => {
       classifications,
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
-    expect(report.markdown).toContain("**How To Question**");
-    expect(report.markdown).toContain("**Complaint Or Objection**");
+    expect(report.markdown).toContain("**Viewer comment about access channel");
+    expect(report.markdown).not.toContain("**How To Question**");
+    expect(report.markdown).not.toContain("**Complaint Or Objection**");
     expect(report.markdown).toContain("1 comment");
     expect(report.markdown).not.toContain(
       "Question that could inspire an idea",
     );
     expect(report.markdown).not.toContain("and 1 more");
-    expect(report.html).toContain("How To Question");
+    expect(report.html).toContain("Viewer comment about access channel");
+    expect(report.titleFallbacks.ideas).toMatchObject({
+      count: 4,
+      reason: "no validated writing-model title",
+    });
   });
 
   it("renders validated cluster titles without markdown escapes or copied comment openings", () => {
@@ -1249,11 +1263,189 @@ describe("report generation", () => {
     expect(report.markdown).toContain("**Using other AIs instead of Claude**");
     expect(report.markdown).toContain("2 comments");
     expect(report.markdown).not.toContain("\\");
-    expect(report.markdown).toContain(
-      "A video &#40;Claude &#43; TradingView&#41;",
-    );
+    expect(report.markdown).toContain("A video (Claude + TradingView)");
+    expect(report.markdown).not.toContain("&#");
     expect(report.html).toContain("Using other AIs instead of Claude");
     expect(report.html).toContain("A video (Claude + TradingView)");
+  });
+
+  it("uses a writing-model title for a singleton and reports neutral-title fallbacks", () => {
+    const request = { ...comment, text: "Could you explain account access?" };
+    const report = renderReport(
+      {
+        channel,
+        videos: [video],
+        comments: [request],
+        classifications: [
+          {
+            commentId: request.commentId,
+            category: "topic_request",
+            quote: request.text,
+          },
+        ],
+        dateRange: { from: "2026-02-13", to: "2026-03-15" },
+      },
+      {
+        ideas: {
+          clusters: [{ title: "Explaining account access", ids: [1] }],
+          commentIds: [request.commentId],
+        },
+      },
+    );
+    expect(report.markdown).toContain("**Explaining account access**");
+    expect(report.titleFallbacks.ideas).toBeUndefined();
+    expect(report.reportDestinationCounts.ideas).toBe(1);
+  });
+
+  it("includes only a verbatim source snippet when an answer source is available", () => {
+    const actionable = {
+      ...comment,
+      text: "What are the pricing details in the pinned guide?",
+    };
+    const description =
+      "Pricing details are in the pinned guide. Other unrelated information follows.";
+    const report = renderReport({
+      channel,
+      videos: [{ ...video, description }],
+      comments: [actionable],
+      classifications: [
+        {
+          commentId: actionable.commentId,
+          category: "buying_or_sponsor_inquiry",
+          quote: actionable.text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+
+    const answerLine = report.markdown
+      .split("\n")
+      .find((line) => line.startsWith("Answer found in:"));
+    expect(answerLine).toContain("Pricing details are in the pinned guide.");
+    expect(description).toContain("Pricing details are in the pinned guide.");
+    expect(answerLine?.length).toBeLessThan(150);
+  });
+
+  it("uses singular grammar for one keyword-response viewer", () => {
+    const text = "full course";
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [{ ...comment, text }],
+      classifications: [
+        {
+          commentId: comment.commentId,
+          category: "keyword_response",
+          quote: text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain(
+      "1 viewer commented a 'full course' variant; the creator replied to 0",
+    );
+  });
+
+  it("routes unanswered mentoring to B, answered objections to E, and reconciles destinations", () => {
+    const entries = [
+      { ...comment, commentId: "money", text: "How much does access cost?" },
+      {
+        ...comment,
+        commentId: "mentor",
+        text: "Could you mentor me as I learn trading?",
+      },
+      {
+        ...comment,
+        commentId: "answered-objection",
+        text: "This setup is confusing.",
+        creatorReplied: true,
+      },
+      {
+        ...comment,
+        commentId: "open-objection",
+        text: "This setup is too risky.",
+      },
+      { ...comment, commentId: "proof", text: "This lesson helped me learn." },
+      { ...comment, commentId: "praise", text: "Great explanation." },
+      { ...comment, commentId: "noise", text: "🔥" },
+      { ...comment, commentId: "keyword", text: "full course" },
+      {
+        ...comment,
+        commentId: "purchase",
+        text: "I just bought the annual plan.",
+      },
+    ];
+    const categories = [
+      "buying_or_sponsor_inquiry",
+      "mentoring_or_personal_request",
+      "complaint_or_objection",
+      "complaint_or_objection",
+      "testimonial_or_result",
+      "praise",
+      "spam_or_noise",
+      "keyword_response",
+      "purchase_intent",
+    ] as const;
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: entries,
+      classifications: entries.map((entry, index) => ({
+        commentId: entry.commentId,
+        category: categories[index]!,
+        quote: entry.text,
+      })),
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const section = (start: string, end: string) =>
+      report.markdown.slice(
+        report.markdown.indexOf(start),
+        report.markdown.indexOf(end),
+      );
+    expect(section("## B.", "## C.")).toContain("mentor");
+    expect(section("## A.", "## B.")).not.toContain("mentor");
+    expect(section("## C.", "## D.")).toContain("open-objection");
+    expect(section("## C.", "## D.")).not.toContain("answered-objection");
+    expect(section("## E.", "---")).toContain("answered-objection");
+    expect(
+      Object.values(report.reportDestinationCounts).reduce(
+        (total, count) => total + count,
+        0,
+      ),
+    ).toBe(entries.length);
+    expect(report.reportDestinationCounts).toMatchObject({
+      money: 1,
+      ideas: 1,
+      fixes: 1,
+      proofs: 1,
+      answered: 1,
+      noise: 1,
+      keywordGroup: 1,
+      purchaseIntent: 1,
+      praise: 1,
+    });
+  });
+
+  it("keeps Markdown titles literal and escapes HTML through the HTML renderer", () => {
+    const title = "MASTER AI Trading Bots in 61 Minutes (Claude + TradingView)";
+    const report = renderReport({
+      channel,
+      videos: [{ ...video, title: `${title} & <guide>` }],
+      comments: [comment],
+      classifications: [
+        {
+          commentId: comment.commentId,
+          category: "buying_or_sponsor_inquiry",
+          quote: comment.text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain(`${title} & <guide>`);
+    expect(report.markdown).not.toContain("&#");
+    expect(report.html).toContain(
+      "MASTER AI Trading Bots in 61 Minutes (Claude + TradingView) &amp; &lt;guide&gt;",
+    );
   });
 
   it("puts a post-purchase access problem before other unanswered questions", () => {
@@ -1283,7 +1475,7 @@ describe("report generation", () => {
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
     const problemIndex = report.markdown.indexOf("**Customer problem**");
-    const purchaseIndex = report.markdown.indexOf("Buying Or Sponsor Inquiry");
+    const purchaseIndex = report.markdown.indexOf(purchaseText);
     const sectionC = report.markdown.slice(
       report.markdown.indexOf("## C. Fix list"),
       report.markdown.indexOf("## D. Proof pack"),

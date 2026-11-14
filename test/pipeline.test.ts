@@ -190,6 +190,7 @@ describe("run pipeline", () => {
       commentsSentToLlm: number;
       classificationsByCategory: Record<string, number>;
       reportItemsBySection: Record<string, number>;
+      reportDestinationCounts: Record<string, number>;
       droppedQuotes: Record<string, number>;
     };
     expect(stats).toMatchObject({
@@ -205,6 +206,12 @@ describe("run pipeline", () => {
         missingVideo: 0,
       },
     });
+    expect(
+      Object.values(stats.reportDestinationCounts).reduce(
+        (total, count) => total + count,
+        0,
+      ),
+    ).toBe(stats.classificationsByCategory.how_to_question);
   });
 
   it("excludes creator comments and reconciles fetched, classified, and unclassified counts", async () => {
@@ -320,6 +327,12 @@ describe("run pipeline", () => {
         result.stats.commentsClassified +
         result.stats.unclassified,
     );
+    expect(
+      Object.values(result.stats.reportDestinationCounts).reduce(
+        (total, count) => total + count,
+        0,
+      ),
+    ).toBe(result.stats.commentsClassified);
   });
 
   it("classifies repeated short phrases as keyword responses without an LLM call", async () => {
