@@ -234,18 +234,26 @@ describe("comment analysis safety", () => {
             contents: { parts: { text: string }[] }[];
             generationConfig: {
               responseMimeType: string;
-              responseSchema: unknown;
-              thinkingConfig: { thinkingBudget: number };
+              maxOutputTokens: number;
+              responseSchema?: unknown;
+              thinkingConfig?: { thinkingBudget: number };
             };
+            systemInstruction: unknown;
           };
           const prompt = request.contents[0]?.parts[0]?.text ?? "";
           prompts.push(prompt);
           if (prompts.length === 1) {
             expect(request.generationConfig).toMatchObject({
               responseMimeType: "application/json",
-              thinkingConfig: { thinkingBudget: 0 },
             });
-            expect(request.generationConfig.responseSchema).toBeDefined();
+            expect(request.generationConfig.maxOutputTokens).toBeGreaterThan(0);
+            expect(request.generationConfig).not.toHaveProperty(
+              "thinkingConfig",
+            );
+            expect(request.generationConfig).not.toHaveProperty(
+              "responseSchema",
+            );
+            expect(request.systemInstruction).toBeDefined();
             return new Response(
               JSON.stringify({
                 candidates: [
@@ -311,6 +319,127 @@ describe("comment analysis safety", () => {
       usageMetadata: { thoughtsTokenCount: 12 },
       rawResponseTextLength: 0,
     });
+  });
+
+  it("downgrades a model that rejects thinkingConfig and remembers the rejection", async () => {
+    const requestBodies: {
+      generationConfig: Record<string, unknown>;
+      contents: unknown[];
+    }[] = [];
+    const events: { outcome: string; droppedFields?: string[] }[] = [];
+    const secondComment = {
+      ...comment,
+      commentId: "c2",
+      text: "How can I configure this?",
+    };
+    const result = await analyzeComments([comment, secondComment], {
+      provider: "gemini",
+      model: "test-model",
+      modelOptions: { "test-model": { thinkingBudget: 0 } },
+      apiKey: "test-key",
+      batchSize: 1,
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          generationConfig: Record<string, unknown>;
+          contents: { parts: { text: string }[] }[];
+        };
+        requestBodies.push(request);
+        if (requestBodies.length === 1)
+          return new Response(
+            JSON.stringify({
+              error: {
+                status: "INVALID_ARGUMENT",
+                message: "Unknown field thinkingConfig.",
+              },
+            }),
+            { status: 400 },
+          );
+        const secondCommentRequested =
+          request.contents[0]?.parts[0]?.text.includes('"commentId":"c2"');
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                finishReason: "STOP",
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        classifications: [
+                          {
+                            commentId: secondCommentRequested ? "c2" : "c1",
+                            category: "how_to_question",
+                            quote: secondCommentRequested
+                              ? "How can I configure this?"
+                              : "How do I use this?",
+                          },
+                        ],
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      },
+      onBatchEvent: (event) => events.push(event),
+    });
+    expect(requestBodies).toHaveLength(3);
+    expect(requestBodies[0]?.generationConfig).toHaveProperty("thinkingConfig");
+    expect(requestBodies[1]?.generationConfig).not.toHaveProperty(
+      "thinkingConfig",
+    );
+    expect(requestBodies[2]?.generationConfig).not.toHaveProperty(
+      "thinkingConfig",
+    );
+    expect(events.at(-1)).toMatchObject({
+      outcome: "success",
+      droppedFields: ["thinkingConfig"],
+    });
+    expect(result.classifications).toHaveLength(2);
+    expect(result.failedBatches).toEqual([]);
+  });
+
+  it("includes sanitized API error details without exposing keys or comment text", async () => {
+    const apiKey = "classified-provider-key";
+    const apiError = `invalid argument: ${apiKey}; How do I use this? ${"x".repeat(500)}`;
+    const events: { outcome: string; reason?: string }[] = [];
+    await expect(
+      analyzeComments([comment], {
+        provider: "gemini",
+        model: "test-model",
+        apiKey,
+        maxUsdPerRun: 1,
+        maxUsdPerDay: 1,
+        dailyUsage: [],
+        fetcher: async () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                status: "INVALID_ARGUMENT",
+                message: apiError,
+                details: [{ reason: "unsupported field" }],
+              },
+            }),
+            { status: 400 },
+          ),
+        onBatchEvent: (event) => events.push(event),
+      }),
+    ).rejects.toThrow(/INVALID_ARGUMENT.*invalid argument.*details=/);
+    const errorEvent = events.find(
+      (event) => event.outcome === "provider_error",
+    );
+    expect(errorEvent?.reason).toContain("INVALID_ARGUMENT");
+    expect(errorEvent?.reason).toContain("unsupported field");
+    expect(errorEvent?.reason).not.toContain(apiKey);
+    expect(errorEvent?.reason).not.toContain(comment.text);
+    expect(errorEvent?.reason).not.toContain("How do I use this?");
+    expect(errorEvent?.reason?.length).toBeLessThanOrEqual(300);
   });
 
   it("accepts a complete classification for every comment ID", async () => {

@@ -27,6 +27,16 @@ const configSchema = z
       .default("gemini"),
     model: z.string().min(1).optional(),
     fallbackModel: z.string().min(1).optional(),
+    modelOptions: z
+      .record(
+        z.object({
+          responseMimeType: z.string().min(1).optional(),
+          responseSchema: z.record(z.unknown()).optional(),
+          thinkingBudget: z.number().int().optional(),
+          maxOutputTokens: z.number().int().min(1).optional(),
+        }),
+      )
+      .optional(),
     emailFrom: z.string().min(1).optional(),
     limits: z
       .object({
@@ -76,6 +86,7 @@ export async function loadConfig(path = "config.json"): Promise<AppConfig> {
     provider: data.provider,
     ...(data.model ? { model: data.model } : {}),
     ...(data.fallbackModel ? { fallbackModel: data.fallbackModel } : {}),
+    ...(data.modelOptions ? { modelOptions: data.modelOptions } : {}),
     ...(data.emailFrom ? { emailFrom: data.emailFrom } : {}),
     limits: data.limits,
     channels: data.channels.map((channel) => ({

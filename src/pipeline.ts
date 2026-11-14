@@ -118,6 +118,9 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     ...(options.config.fallbackModel
       ? { fallbackModel: options.config.fallbackModel }
       : {}),
+    ...(options.config.modelOptions
+      ? { modelOptions: options.config.modelOptions }
+      : {}),
     maxUsdPerRun: options.config.limits.maxUsdPerRun,
     maxUsdPerDay: options.config.limits.maxUsdPerDay,
     ...(options.config.limits.maxOutputTokensPerComment !== undefined
@@ -152,6 +155,10 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
                 usageMetadata: event.usageMetadata ?? null,
                 rawResponseTextLength: event.rawResponseTextLength ?? 0,
                 outcome: event.outcome,
+                ...(event.reason ? { reason: event.reason } : {}),
+                ...(event.droppedFields
+                  ? { droppedFields: event.droppedFields }
+                  : {}),
               })}`,
             );
           },

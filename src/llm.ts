@@ -7,6 +7,7 @@ import type {
   Classification,
   CommentRecord,
   Fetcher,
+  GeminiModelOptions,
   ProviderName,
   UsageRecord,
 } from "./types.js";
@@ -48,6 +49,7 @@ interface LlmOptions {
   provider: ProviderName;
   model?: string;
   fallbackModel?: string;
+  modelOptions?: Record<string, GeminiModelOptions>;
   apiKey?: string;
   fetcher?: Fetcher;
   usagePath?: string;
@@ -74,7 +76,8 @@ export interface BatchEvent {
     | "json_parse_failure"
     | "schema_validation_failure"
     | "coverage_failure"
-    | "truncated";
+    | "truncated"
+    | "provider_error";
   reason?: string;
   model?: string;
   commentsSent?: number;
@@ -90,6 +93,7 @@ export interface BatchEvent {
   };
   rawResponseTextLength?: number;
   chunk?: string;
+  droppedFields?: string[];
 }
 
 export interface FailedBatch {
@@ -293,7 +297,12 @@ async function requestProvider(
   fetcher: Fetcher,
   wait: (milliseconds: number) => Promise<void>,
   onRetry: (model: string, attempt: number, status: number) => void,
-): Promise<ReturnType<typeof extractText> & { model: string }> {
+  modelOptions: Record<string, GeminiModelOptions>,
+  droppedByModel: Map<string, Set<"thinkingConfig" | "responseSchema">>,
+  commentTexts: string[],
+): Promise<
+  ReturnType<typeof extractText> & { model: string; droppedFields: string[] }
+> {
   let url: string;
   let headers: Record<string, string>;
   let body: Record<string, unknown>;
@@ -304,6 +313,11 @@ async function requestProvider(
   let latestStatus = 0;
   let latestMessage = "LLM request failed.";
   for (const [modelIndex, selectedModel] of configuredModels.entries()) {
+    const selectedModelOptions = modelOptions[selectedModel] ?? {};
+    const droppedFields =
+      droppedByModel.get(selectedModel) ??
+      new Set<"thinkingConfig" | "responseSchema">();
+    droppedByModel.set(selectedModel, droppedFields);
     if (provider === "gemini") {
       url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(selectedModel)}:generateContent`;
       headers = {
@@ -312,32 +326,30 @@ async function requestProvider(
       };
       body = {
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: "OBJECT",
-            properties: {
-              classifications: {
-                type: "ARRAY",
-                items: {
-                  type: "OBJECT",
-                  properties: {
-                    commentId: { type: "STRING" },
-                    category: { type: "STRING", enum: categories },
-                    quote: { type: "STRING" },
-                    timestamp: { type: "STRING" },
-                    draftReply: { type: "STRING" },
-                    idea: { type: "STRING" },
-                  },
-                  required: ["commentId", "category", "quote"],
-                },
-              },
+        systemInstruction: {
+          parts: [
+            {
+              text: "Classify each supplied comment according to the user's classification instructions. Return only the requested JSON.",
             },
-            required: ["classifications"],
-          },
-          thinkingConfig: { thinkingBudget: 0 },
-          temperature: 0.1,
-          maxOutputTokens: outputTokenLimit,
+          ],
+        },
+        generationConfig: {
+          responseMimeType:
+            selectedModelOptions.responseMimeType ?? "application/json",
+          maxOutputTokens:
+            selectedModelOptions.maxOutputTokens ?? outputTokenLimit,
+          ...(!droppedFields.has("responseSchema") &&
+          selectedModelOptions.responseSchema
+            ? { responseSchema: selectedModelOptions.responseSchema }
+            : {}),
+          ...(!droppedFields.has("thinkingConfig") &&
+          selectedModelOptions.thinkingBudget !== undefined
+            ? {
+                thinkingConfig: {
+                  thinkingBudget: selectedModelOptions.thinkingBudget,
+                },
+              }
+            : {}),
         },
       };
     } else if (provider === "anthropic") {
@@ -392,7 +404,11 @@ async function requestProvider(
         responseBody = {};
       }
       if (response.ok)
-        return { ...extractText(provider, responseBody), model: selectedModel };
+        return {
+          ...extractText(provider, responseBody),
+          model: selectedModel,
+          droppedFields: [...droppedFields],
+        };
       const root =
         responseBody && typeof responseBody === "object"
           ? (responseBody as Record<string, unknown>)
@@ -402,11 +418,33 @@ async function requestProvider(
           ? (root.error as Record<string, unknown>)
           : {};
       latestStatus = response.status;
-      latestMessage = redactSecrets(
-        String(
-          errorObj.message ?? response.statusText ?? "LLM request failed.",
-        ),
+      const apiDetails =
+        errorObj.details === undefined
+          ? ""
+          : `; details=${JSON.stringify(errorObj.details)}`;
+      const apiStatus = String(errorObj.status ?? "unknown");
+      const apiMessage = String(
+        errorObj.message ?? response.statusText ?? "LLM request failed.",
       );
+      latestMessage = sanitizeProviderError(
+        `status=${apiStatus.slice(0, 32)}; message=${apiMessage.slice(0, 100)}${apiDetails.slice(0, 110)}`,
+        apiKey,
+        commentTexts,
+      );
+      if (response.status === 400 && provider === "gemini") {
+        const rejectedField = findRejectedOptionalField(
+          `${apiStatus} ${apiMessage} ${apiDetails}`,
+          body,
+          droppedFields,
+        );
+        if (rejectedField) {
+          droppedFields.add(rejectedField);
+          const generationConfig = body.generationConfig as
+            Record<string, unknown> | undefined;
+          if (generationConfig) delete generationConfig[rejectedField];
+          continue;
+        }
+      }
       if (response.status === 429 || response.status === 503) {
         if (attempt < 4) {
           onRetry(selectedModel, attempt + 1, response.status);
@@ -416,22 +454,90 @@ async function requestProvider(
         if (modelIndex + 1 < configuredModels.length) break;
         if (response.status === 429)
           throw new QuotaError(
-            `LLM quota/rate limit reached: ${latestMessage}`,
+            truncateErrorDetail(
+              `LLM quota/rate limit reached (${response.status}): ${latestMessage}`,
+            ),
           );
       } else if (response.status === 402) {
-        throw new QuotaError(`LLM quota/rate limit reached: ${latestMessage}`);
-      } else {
-        throw new Error(
-          `LLM provider request failed (${response.status}): ${latestMessage}`,
+        throw new QuotaError(
+          truncateErrorDetail(
+            `LLM quota/rate limit reached (${response.status}): ${latestMessage}`,
+          ),
         );
+      } else {
+        throw new Error(providerFailureMessage(response.status, latestMessage));
       }
     }
   }
   if (latestStatus === 429)
-    throw new QuotaError(`LLM quota/rate limit reached: ${latestMessage}`);
-  throw new Error(
-    `LLM provider request failed (${latestStatus}): ${latestMessage}`,
+    throw new QuotaError(
+      truncateErrorDetail(
+        `LLM quota/rate limit reached (${latestStatus}): ${latestMessage}`,
+      ),
+    );
+  throw new Error(providerFailureMessage(latestStatus, latestMessage));
+}
+
+function truncateErrorDetail(detail: string): string {
+  return detail.length > 300 ? `${detail.slice(0, 297)}...` : detail;
+}
+
+function providerFailureMessage(status: number, detail: string): string {
+  return truncateErrorDetail(
+    `LLM provider request failed (${status}): ${detail}`,
   );
+}
+
+function sanitizeProviderError(
+  detail: string,
+  apiKey: string,
+  commentTexts: string[],
+): string {
+  let sanitized = redactSecrets(detail);
+  if (apiKey) sanitized = sanitized.replaceAll(apiKey, "[REDACTED]");
+  for (const commentText of commentTexts) {
+    if (!commentText) continue;
+    sanitized = sanitized.replaceAll(commentText, "[COMMENT REDACTED]");
+    const words = commentText.match(/\S+/g) ?? [];
+    for (let start = 0; start < words.length; start += 1) {
+      for (
+        let length = 3;
+        length <= 8 && start + length <= words.length;
+        length += 1
+      ) {
+        const phrase = words.slice(start, start + length).join(" ");
+        sanitized = sanitized.replaceAll(phrase, "[COMMENT REDACTED]");
+      }
+    }
+  }
+  return truncateErrorDetail(sanitized);
+}
+
+function findRejectedOptionalField(
+  errorText: string,
+  body: Record<string, unknown>,
+  droppedFields: Set<"thinkingConfig" | "responseSchema">,
+): "thinkingConfig" | "responseSchema" | undefined {
+  if (
+    !/(unsupported|unknown|unrecognized|not supported|unexpected)/i.test(
+      errorText,
+    )
+  )
+    return undefined;
+  const generationConfig = body.generationConfig as
+    Record<string, unknown> | undefined;
+  const available = (["thinkingConfig", "responseSchema"] as const).filter(
+    (field) =>
+      generationConfig?.[field] !== undefined && !droppedFields.has(field),
+  );
+  const named = available.find((field) => {
+    const apiName = field.replace(
+      /[A-Z]/g,
+      (letter) => `_${letter.toLowerCase()}`,
+    );
+    return new RegExp(`\\b(?:${field}|${apiName})\\b`, "i").test(errorText);
+  });
+  return named ?? available[0];
 }
 
 function mockClassifications(comments: CommentRecord[]): ClassificationResult {
@@ -523,6 +629,10 @@ export async function analyzeComments(
   const failedBatches: FailedBatch[] = [];
   const fetcher = options.fetcher ?? fetch;
   const provider = options.provider;
+  const droppedByModel = new Map<
+    string,
+    Set<"thinkingConfig" | "responseSchema">
+  >();
   const wait =
     options.wait ??
     ((milliseconds) =>
@@ -533,8 +643,21 @@ export async function analyzeComments(
     options.onProgress?.(`Classifying batch ${batchNumber} of ${batchCount}.`);
     const prompt = buildClassificationPrompt(batch);
     const inputEstimate = estimateTokens(prompt);
-    const outputEstimate =
+    const defaultOutputEstimate =
       outputTokenOverhead + batch.length * outputTokensPerComment;
+    const configuredOutputEstimate = [
+      options.model,
+      options.fallbackModel,
+    ].flatMap((model) => {
+      const maxOutputTokens = model
+        ? options.modelOptions?.[model]?.maxOutputTokens
+        : undefined;
+      return maxOutputTokens === undefined ? [] : [maxOutputTokens];
+    });
+    const outputEstimate = Math.max(
+      defaultOutputEstimate,
+      ...configuredOutputEstimate,
+    );
     const projectedCost = estimatedUsd(provider, inputEstimate, outputEstimate);
     if (
       priorRun.estimatedUsd + projectedCost > options.maxUsdPerRun ||
@@ -596,18 +719,46 @@ export async function analyzeComments(
               ? `\nSTRICT FORMAT REMINDER: Return exactly one classification for each expected comment ID and no other IDs. Expected IDs: ${JSON.stringify(expectedIdList)}. Do not omit, duplicate, or add IDs.`
               : "";
           const chunkOutputLimit =
+            options.modelOptions?.[options.model!]?.maxOutputTokens ??
             outputTokenOverhead + chunk.length * outputTokensPerComment;
-          const response = await requestProvider(
-            llmProvider,
-            options.model!,
-            options.fallbackModel,
-            options.apiKey!,
-            `${chunkPrompt}${strictReminder}`,
-            chunkOutputLimit,
-            fetcher,
-            wait,
-            () => {},
-          );
+          let response: Awaited<ReturnType<typeof requestProvider>>;
+          try {
+            response = await requestProvider(
+              llmProvider,
+              options.model!,
+              options.fallbackModel,
+              options.apiKey!,
+              `${chunkPrompt}${strictReminder}`,
+              chunkOutputLimit,
+              fetcher,
+              wait,
+              () => {},
+              options.modelOptions ?? {},
+              droppedByModel,
+              chunk.map((comment) => comment.text),
+            );
+          } catch (error) {
+            const droppedFields = [
+              ...new Set(
+                [options.model, options.fallbackModel]
+                  .filter((model): model is string => model !== undefined)
+                  .flatMap((model) => [...(droppedByModel.get(model) ?? [])]),
+              ),
+            ];
+            options.onBatchEvent?.({
+              batch: batchNumber,
+              totalBatches: batchCount,
+              chunk: chunkLabel,
+              attempt,
+              commentsSent: chunk.length,
+              outcome: "provider_error",
+              reason: truncateErrorDetail(
+                error instanceof Error ? error.message : String(error),
+              ),
+              ...(droppedFields.length > 0 ? { droppedFields } : {}),
+            });
+            throw error;
+          }
           chunkInputTokens += response.input || estimateTokens(chunkPrompt);
           chunkOutputTokens += response.output || estimateTokens(response.text);
           const baseEvent = {
@@ -629,6 +780,9 @@ export async function analyzeComments(
               : {}),
             rawResponseTextLength: response.text.length,
             model: response.model,
+            ...(response.droppedFields.length > 0
+              ? { droppedFields: response.droppedFields }
+              : {}),
           };
           if (response.finishReason === "MAX_TOKENS") {
             options.onBatchEvent?.({

@@ -23,10 +23,18 @@ export interface ChannelConfig {
   productKeywords: string[];
 }
 
+export interface GeminiModelOptions {
+  responseMimeType?: string | undefined;
+  responseSchema?: Record<string, unknown> | undefined;
+  thinkingBudget?: number | undefined;
+  maxOutputTokens?: number | undefined;
+}
+
 export interface AppConfig {
   provider: ProviderName;
   model?: string;
   fallbackModel?: string;
+  modelOptions?: Record<string, GeminiModelOptions>;
   emailFrom?: string;
   limits: {
     maxVideos: number;
