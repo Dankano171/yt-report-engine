@@ -705,6 +705,7 @@ export async function analyzeComments(
   comments: CommentRecord[],
   options: LlmOptions,
 ): Promise<AnalysisResult> {
+  comments = comments.filter((comment) => comment.text.trim().length > 0);
   const now = options.now ?? new Date();
   const date = now.toISOString().slice(0, 10);
   const usageRows = options.dailyUsage ?? (await readUsage(options.usagePath));

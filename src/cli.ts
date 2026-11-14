@@ -27,6 +27,10 @@ program
   .option("--debug", "Log sanitized LLM batch outcomes")
   .option("--dump-prompt", "Save LLM prompts and raw responses under output/")
   .option(
+    "--dump-youtube",
+    "Save the first three raw comment threads from the first video",
+  )
+  .option(
     "--classify-only",
     "Classify the first batch only; do not write a report",
   )
@@ -39,6 +43,7 @@ program
       debug?: boolean;
       classifyOnly?: boolean;
       dumpPrompt?: boolean;
+      dumpYoutube?: boolean;
     }) => {
       if (options.send && options.dryRun)
         throw new Error("Choose either --send or --dry-run, not both.");
@@ -57,6 +62,7 @@ program
           options.dumpPrompt === true,
         classifyOnly: options.classifyOnly === true,
         dumpPrompt: options.dumpPrompt === true,
+        dumpYoutube: options.dumpYoutube === true,
       });
       if (result.classifyOnly) {
         console.log(

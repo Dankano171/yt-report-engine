@@ -18,6 +18,7 @@ interface YouTubeOptions {
   fetcher?: Fetcher;
   wait?: (milliseconds: number) => Promise<void>;
   onProgress?: (message: string) => void;
+  onCommentThreadsSample?: (items: unknown[]) => Promise<void>;
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -261,6 +262,7 @@ export async function fetchChannelData(
 
   options.onProgress?.(`${videos.length} videos found.`);
   const comments: CommentRecord[] = [];
+  const youtubeSample: unknown[] = [];
   for (const [videoIndex, video] of videos.entries()) {
     options.onProgress?.(
       `Fetching comments for video ${videoIndex + 1} of ${videos.length}.`,
@@ -294,9 +296,14 @@ export async function fetchChannelData(
       }
       quotaUnits += 1;
       const threadList = array(page.items);
+      if (videoIndex === 0 && youtubeSample.length < 3) {
+        youtubeSample.push(...threadList.slice(0, 3 - youtubeSample.length));
+        await options.onCommentThreadsSample?.([...youtubeSample]);
+      }
       for (const threadRaw of threadList) {
         const thread = object(threadRaw);
         const threadSnippet = object(thread.snippet);
+        const topLevelComment = object(threadSnippet.topLevelComment);
         const totalReplies = number(threadSnippet.totalReplyCount);
         const replies = array(object(thread.replies).comments);
         const creatorReply = replies.find(
@@ -320,7 +327,7 @@ export async function fetchChannelData(
               "comments",
               {
                 part: "snippet",
-                parentId: string(object(thread.topLevelComment).id),
+                parentId: string(topLevelComment.id),
                 textFormat: "plainText",
                 maxResults: "100",
                 ...(replyToken ? { pageToken: replyToken } : {}),
@@ -348,7 +355,7 @@ export async function fetchChannelData(
         }
         comments.push(
           commentFrom(
-            thread.topLevelComment,
+            topLevelComment,
             video.videoId,
             totalReplies,
             creatorReplied,

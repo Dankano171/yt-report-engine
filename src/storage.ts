@@ -77,7 +77,11 @@ export async function purgeOldDebugDumps(
         throw error;
       }
       for (const entry of entries) {
-        if (!/^batch-\d+-(?:prompt|response)\.txt$/.test(entry)) continue;
+        if (
+          !/^batch-\d+-(?:prompt|response)\.txt$/.test(entry) &&
+          entry !== "youtube-sample.json"
+        )
+          continue;
         const path = join(debugPath, entry);
         const info = await stat(path);
         if (info.isFile() && info.mtimeMs < expiry) {

@@ -65,18 +65,23 @@ function fetcher(commentCount = 1, texts?: string[]): Fetcher {
         items: Array.from({ length: commentCount }, (_, index) => ({
           snippet: {
             totalReplyCount: 0,
-          },
-          topLevelComment: {
-            id: `comment${index + 1}`,
-            snippet: {
-              textOriginal:
-                texts?.[index] ??
-                (index === 0
-                  ? "How do I set this up?"
-                  : `How do I set this up ${index + 1}?`),
-              likeCount: 8,
-              publishedAt: "2026-03-11T12:00:00Z",
-              authorChannelId: { value: "UCviewer" },
+            topLevelComment: {
+              id: `comment${index + 1}`,
+              snippet: {
+                textOriginal:
+                  texts?.[index] ??
+                  (index === 0
+                    ? "How do I set this up?"
+                    : `How do I set this up ${index + 1}?`),
+                textDisplay:
+                  texts?.[index] ??
+                  (index === 0
+                    ? "How do I set this up?"
+                    : `How do I set this up ${index + 1}?`),
+                likeCount: 8,
+                publishedAt: "2026-03-11T12:00:00Z",
+                authorChannelId: { value: "UCviewer" },
+              },
             },
           },
         })),
@@ -234,7 +239,7 @@ describe("run pipeline", () => {
     root = await mkdtemp(join(tmpdir(), "yt-report-prompt-dump-"));
     process.env.YOUTUBE_API_KEY = "test-youtube-secret";
     process.env.LLM_API_KEY = "test-llm-secret";
-    const youtubeFetcher = fetcher(1, ["How do I set this up?"]);
+    const youtubeFetcher = fetcher(4);
     const geminiFetcher: Fetcher = async (input, init) => {
       if (new URL(String(input)).hostname === "www.googleapis.com")
         return youtubeFetcher(input, init);
@@ -246,9 +251,13 @@ describe("run pipeline", () => {
               content: {
                 parts: [
                   {
-                    text: JSON.stringify([
-                      { id: 1, category: "how_to_question", timestamp: null },
-                    ]),
+                    text: JSON.stringify(
+                      Array.from({ length: 4 }, (_, index) => ({
+                        id: index + 1,
+                        category: "how_to_question",
+                        timestamp: null,
+                      })),
+                    ),
                   },
                 ],
               },
@@ -264,6 +273,7 @@ describe("run pipeline", () => {
       days: 30,
       send: false,
       dumpPrompt: true,
+      dumpYoutube: true,
       outputRoot: join(root, "output"),
       cacheRoot: join(root, "cache"),
       usagePath: join(root, "usage", "usage.jsonl"),
@@ -285,16 +295,85 @@ describe("run pipeline", () => {
     );
     expect(prompt).toContain("USER CONTENT");
     expect(prompt).toContain("How do I set this up?");
+    expect(prompt).toContain('"likeCount":8');
     expect(response).toContain('\\"category\\":\\"how_to_question\\"');
     expect(prompt).not.toContain("test-llm-secret");
     expect(response).not.toContain("test-llm-secret");
     expect(prompt).not.toContain("test-youtube-secret");
     expect(prompt).not.toContain("generativelanguage.googleapis.com");
+    const youtubeSample = await readFile(
+      join(debugFolder, "youtube-sample.json"),
+      "utf8",
+    );
+    expect(JSON.parse(youtubeSample)).toHaveLength(3);
+    expect(youtubeSample).toContain('"textOriginal": "How do I set this up?"');
+    expect(youtubeSample).not.toContain("test-youtube-secret");
+    expect(youtubeSample).not.toContain("googleapis.com");
     expect(
       await stat(join(debugFolder, "batch-1-prompt.txt")).then(
         (file) => file.mode & 0o777,
       ),
     ).toBe(0o600);
+  });
+
+  it("aborts before classification and records empty YouTube text in stats", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-empty-text-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-secret";
+    process.env.LLM_API_KEY = "test-llm-secret";
+    const youtubeFetcher = fetcher(4);
+    let llmCalls = 0;
+    const emptyTextFetcher: Fetcher = async (input, init) => {
+      if (new URL(String(input)).hostname !== "www.googleapis.com") {
+        llmCalls += 1;
+        throw new Error("LLM must not be called for blank comments");
+      }
+      const response = await youtubeFetcher(input, init);
+      if (!new URL(String(input)).pathname.endsWith("/commentThreads"))
+        return response;
+      const payload = (await response.json()) as {
+        items: {
+          snippet: {
+            topLevelComment: { snippet: Record<string, unknown> };
+          };
+        }[];
+      };
+      for (const thread of payload.items) {
+        thread.snippet.topLevelComment.snippet.textOriginal = "";
+        thread.snippet.topLevelComment.snippet.textDisplay = "";
+      }
+      return new Response(JSON.stringify(payload), { status: 200 });
+    };
+    const outputRoot = join(root, "output");
+    await expect(
+      runChannel({
+        channel,
+        config: { ...config, provider: "openai", model: "test-model" },
+        days: 30,
+        send: false,
+        outputRoot,
+        cacheRoot: join(root, "cache"),
+        usagePath: join(root, "usage", "usage.jsonl"),
+        now: new Date("2026-03-15T00:00:00Z"),
+        fetcher: emptyTextFetcher,
+        wait: async () => {},
+      }),
+    ).rejects.toThrow(/text was lost during YouTube commentThreads parsing/i);
+    expect(llmCalls).toBe(0);
+    const stats = JSON.parse(
+      await readFile(
+        join(outputRoot, "@creator", "2026-03-15", "stats.json"),
+        "utf8",
+      ),
+    ) as {
+      emptyText: number;
+      commentsSentToLlm: number;
+      failureReason: string;
+    };
+    expect(stats).toMatchObject({
+      emptyText: 4,
+      commentsSentToLlm: 0,
+    });
+    expect(stats.failureReason).toMatch(/commentThreads parsing/);
   });
 
   it("records suspicious all-noise batches and retries the fallback model", async () => {

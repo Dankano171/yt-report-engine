@@ -29,6 +29,7 @@ export interface RunOptions {
   debug?: boolean;
   classifyOnly?: boolean;
   dumpPrompt?: boolean;
+  dumpYoutube?: boolean;
 }
 
 export interface RunStats {
@@ -36,6 +37,7 @@ export interface RunStats {
   videosAnalyzed: number;
   commentsFetched: number;
   commentsSentToLlm: number;
+  emptyText: number;
   unclassified: number;
   suspiciousAllNoise: boolean;
   classificationSucceeded: boolean;
@@ -79,6 +81,22 @@ function channelKey(channel: ChannelConfig): string {
   );
 }
 
+function emptyCategoryCounts(): Record<Category, number> {
+  return {
+    buying_or_sponsor_inquiry: 0,
+    how_to_question: 0,
+    confusion_or_error: 0,
+    complaint_or_objection: 0,
+    testimonial_or_result: 0,
+    topic_request: 0,
+    language_or_subtitles_request: 0,
+    alternative_or_tool_request: 0,
+    format_request: 0,
+    praise: 0,
+    spam_or_noise: 0,
+  };
+}
+
 export async function runChannel(options: RunOptions): Promise<RunResult> {
   if (
     !Number.isInteger(options.days) ||
@@ -94,36 +112,14 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   if (!youtubeKey)
     throw new Error("YOUTUBE_API_KEY is required to fetch channel data.");
   const now = options.now ?? new Date();
-  console.log(`Resolving channel ${handleOrId}.`);
-  const data = await fetchChannelData({
-    apiKey: youtubeKey,
-    handleOrId,
-    days: options.days,
-    maxVideos: options.config.limits.maxVideos,
-    maxThreadsPerVideo: options.config.limits.maxThreadsPerVideo,
-    now,
-    ...(options.fetcher ? { fetcher: options.fetcher } : {}),
-    ...(options.wait ? { wait: options.wait } : {}),
-    onProgress: (message) => console.log(message),
-  });
-  const cacheRoot = options.cacheRoot ?? "cache";
-  await cacheComments(
-    channelKey(options.channel),
-    data.comments,
-    cacheRoot,
-    now,
-  );
-  const analysisComments = options.classifyOnly
-    ? data.comments.slice(0, 20)
-    : data.comments;
   const folder = resolve(
     options.outputRoot ?? "output",
     channelKey(options.channel),
     now.toISOString().slice(0, 10),
   );
   const debugFolder = resolve(folder, "debug");
-  if (options.dumpPrompt) await mkdir(debugFolder, { recursive: true });
-  const dumpedBatches = new Set<number>();
+  if (options.dumpPrompt || options.dumpYoutube)
+    await mkdir(debugFolder, { recursive: true });
   const sanitizeDump = (text: string): string => {
     let sanitized = redactSecrets(text);
     for (const key of [
@@ -135,6 +131,103 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     }
     return sanitized;
   };
+  let youtubeSampleWritten = false;
+  console.log(`Resolving channel ${handleOrId}.`);
+  const data = await fetchChannelData({
+    apiKey: youtubeKey,
+    handleOrId,
+    days: options.days,
+    maxVideos: options.config.limits.maxVideos,
+    maxThreadsPerVideo: options.config.limits.maxThreadsPerVideo,
+    now,
+    ...(options.fetcher ? { fetcher: options.fetcher } : {}),
+    ...(options.wait ? { wait: options.wait } : {}),
+    onProgress: (message) => console.log(message),
+    ...(options.dumpYoutube
+      ? {
+          onCommentThreadsSample: async (items: unknown[]) => {
+            await writeFile(
+              resolve(debugFolder, "youtube-sample.json"),
+              `${sanitizeDump(JSON.stringify(items, null, 2))}\n`,
+              { encoding: "utf8", mode: 0o600 },
+            );
+            youtubeSampleWritten = true;
+          },
+        }
+      : {}),
+  });
+  if (options.dumpYoutube && !youtubeSampleWritten) {
+    await writeFile(resolve(debugFolder, "youtube-sample.json"), "[]\n", {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+  }
+  const cacheRoot = options.cacheRoot ?? "cache";
+  await cacheComments(
+    channelKey(options.channel),
+    data.comments,
+    cacheRoot,
+    now,
+  );
+  const emptyText = data.comments.filter(
+    (comment) => !comment.text.trim(),
+  ).length;
+  const textLossRatio =
+    data.comments.length > 0 ? emptyText / data.comments.length : 0;
+  if (textLossRatio > 0.2) {
+    const failureReason =
+      `${emptyText} of ${data.comments.length} fetched comments have empty text. ` +
+      "Text was lost during YouTube commentThreads parsing; expected " +
+      "item.snippet.topLevelComment.snippet.textOriginal or textDisplay.";
+    const stats: RunStats = {
+      date: now.toISOString().slice(0, 10),
+      videosAnalyzed: data.videos.length,
+      commentsFetched: data.comments.length,
+      commentsSentToLlm: 0,
+      emptyText,
+      unclassified: 0,
+      suspiciousAllNoise: false,
+      classificationSucceeded: false,
+      failureReason,
+      stoppedReason: failureReason,
+      ...(options.classifyOnly ? { classifyOnly: true } : {}),
+      batches: {
+        total: 0,
+        successful: 0,
+        failed: [],
+      },
+      classificationsByCategory: emptyCategoryCounts(),
+      reportItemsBySection: {
+        money: 0,
+        ideas: 0,
+        fixes: 0,
+        proofs: 0,
+        answered: 0,
+      },
+      droppedQuotes: {
+        emptyQuote: 0,
+        quoteNotFound: 0,
+        unknownComment: 0,
+        missingVideo: 0,
+      },
+    };
+    await mkdir(folder, { recursive: true });
+    await writeFile(
+      resolve(folder, "stats.json"),
+      `${JSON.stringify(stats, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    throw new Error(
+      `${failureReason} Aborting before LLM classification; stats were saved to ${resolve(folder, "stats.json")}.`,
+    );
+  }
+  const nonEmptyComments = data.comments.filter((comment) =>
+    comment.text.trim(),
+  );
+  const analysisComments = options.classifyOnly
+    ? nonEmptyComments.slice(0, 20)
+    : nonEmptyComments;
+  const dumpedBatches = new Set<number>();
   const analysis = await analyzeComments(analysisComments, {
     provider: options.config.provider,
     ...(options.config.model ? { model: options.config.model } : {}),
@@ -283,19 +376,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
       : {}),
   });
   await mkdir(folder, { recursive: true });
-  const classificationsByCategory: Record<Category, number> = {
-    buying_or_sponsor_inquiry: 0,
-    how_to_question: 0,
-    confusion_or_error: 0,
-    complaint_or_objection: 0,
-    testimonial_or_result: 0,
-    topic_request: 0,
-    language_or_subtitles_request: 0,
-    alternative_or_tool_request: 0,
-    format_request: 0,
-    praise: 0,
-    spam_or_noise: 0,
-  };
+  const classificationsByCategory = emptyCategoryCounts();
   for (const classification of analysis.classifications)
     classificationsByCategory[classification.category] += 1;
   const stats: RunStats = {
@@ -303,6 +384,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
     videosAnalyzed: data.videos.length,
     commentsFetched: data.comments.length,
     commentsSentToLlm: analysis.commentsSentToLlm,
+    emptyText,
     unclassified: analysis.unclassifiedCount,
     suspiciousAllNoise: analysis.suspiciousAllNoise,
     classificationSucceeded: analysis.classificationSucceeded,
@@ -413,6 +495,7 @@ function printRunSummary(stats: RunStats): void {
   console.log(`  Videos analyzed: ${stats.videosAnalyzed}`);
   console.log(`  Comments fetched: ${stats.commentsFetched}`);
   console.log(`  Comments sent to the LLM: ${stats.commentsSentToLlm}`);
+  console.log(`  Comments with empty text: ${stats.emptyText}`);
   console.log(`  Comments unclassified: ${stats.unclassified}`);
   console.log(
     `  Classification status: ${stats.classificationSucceeded ? "complete" : "incomplete"}${stats.stoppedReason ? ` (${stats.stoppedReason})` : ""}`,

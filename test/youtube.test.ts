@@ -52,14 +52,15 @@ function fakeYouTubeFetch(): Fetcher {
           {
             snippet: {
               totalReplyCount: 1,
-            },
-            topLevelComment: {
-              id: "comment-1",
-              snippet: {
-                textOriginal: "How do I use this?",
-                likeCount: 7,
-                publishedAt,
-                authorChannelId: { value: "UCviewer" },
+              topLevelComment: {
+                id: "comment-1",
+                snippet: {
+                  textOriginal: "How do I use this?",
+                  textDisplay: "How do I use this?",
+                  likeCount: 7,
+                  publishedAt,
+                  authorChannelId: { value: "UCviewer" },
+                },
               },
             },
             replies: {
@@ -92,6 +93,10 @@ describe("YouTube data", () => {
     });
     expect(result.videos.map((video) => video.videoId)).toEqual(["video2"]);
     expect(result.comments).toHaveLength(1);
+    expect(result.comments[0]?.text).toBe("How do I use this?");
+    expect(result.comments[0]?.likeCount).toBe(7);
+    expect(result.comments[0]?.authorChannelId).toBe("UCviewer");
+    expect(result.comments[0]?.publishedAt).toBe(publishedAt);
     expect(result.comments[0]?.creatorReplied).toBe(true);
     expect(result.comments[0]?.creatorReplyId).toBe("reply-1");
     expect(result.comments[0]?.totalReplyCount).toBe(1);
@@ -118,16 +123,18 @@ describe("YouTube data", () => {
       const response = await baseFetch(input, init);
       const payload = (await response.json()) as {
         items?: {
-          snippet?: { totalReplyCount?: number };
-          topLevelComment?: { snippet?: Record<string, unknown> };
+          snippet?: {
+            totalReplyCount?: number;
+            topLevelComment?: { snippet?: Record<string, unknown> };
+          };
         }[];
       };
       const thread = payload.items?.[0];
-      const snippet = thread?.topLevelComment?.snippet;
+      const snippet = thread?.snippet?.topLevelComment?.snippet;
       if (snippet) {
         delete snippet.textOriginal;
         snippet.textDisplay = "<b>How</b> &amp; where?";
-        if (thread) thread.snippet = { totalReplyCount: 2 };
+        if (thread?.snippet) thread.snippet.totalReplyCount = 2;
       }
       return new Response(JSON.stringify(payload), { status: 200 });
     };
@@ -147,6 +154,10 @@ describe("YouTube data", () => {
         .filter((url) => /\/(?:commentThreads|comments)$/.test(url.pathname))
         .every((url) => url.searchParams.get("textFormat") === "plainText"),
     ).toBe(true);
+    const threadRequest = requestedUrls.find((url) =>
+      url.pathname.endsWith("/commentThreads"),
+    );
+    expect(threadRequest?.searchParams.get("part")).toBe("snippet,replies");
     expect(
       requestedUrls.some((url) => url.pathname.endsWith("/comments")),
     ).toBe(true);

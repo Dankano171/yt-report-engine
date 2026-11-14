@@ -12,7 +12,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { analyzeComments, buildClassificationPrompt } from "../src/llm.js";
 import { renderReport } from "../src/report.js";
 import { isLowInformationComment } from "../src/classification.js";
-import { purgeOldCache, purgeOldDebugDumps } from "../src/storage.js";
+import {
+  cacheComments,
+  purgeOldCache,
+  purgeOldDebugDumps,
+} from "../src/storage.js";
 import type {
   ChannelConfig,
   CommentRecord,
@@ -91,7 +95,7 @@ describe("comment analysis safety", () => {
     expect(prompt).toContain("COMMENT DATA END");
   });
 
-  it("includes every supplied comment and reports empty text without logging it", async () => {
+  it("omits empty-text comments while preserving text and likes in the prompt", async () => {
     const emptyTextComment = { ...comment, commentId: "empty", text: "" };
     const events: {
       nonEmptyTextCount?: number;
@@ -123,17 +127,17 @@ describe("comment analysis safety", () => {
       },
       onBatchEvent: (event) => events.push(event),
     });
-    expect(prompt).toContain('"text":""');
     expect(prompt).toContain(comment.text);
+    expect(prompt).toContain('"likeCount":7');
+    expect(prompt).not.toContain('"text":""');
     expect(result.classifications.map((item) => item.commentId)).toEqual([
-      "empty",
       "c1",
     ]);
     expect(events[0]).toMatchObject({
       nonEmptyTextCount: 1,
-      minimumTextLength: 0,
+      minimumTextLength: comment.text.length,
     });
-    expect(events[0]?.averageTextLength).toBeGreaterThan(0);
+    expect(events[0]?.averageTextLength).toBe(comment.text.length);
   });
 
   it("retries a suspicious all-noise batch with the fallback model", async () => {
@@ -999,6 +1003,26 @@ describe("report generation", () => {
 });
 
 describe("raw comment cache retention", () => {
+  it("persists full comment text and engagement fields in cache records", async () => {
+    const root = join(await getTempRoot(), "cache");
+    const cachedComment = {
+      ...comment,
+      text: "How do I use the nested API response?",
+      likeCount: 17,
+    };
+    const now = new Date("2026-03-15T00:00:00Z");
+    await cacheComments("@creator", [cachedComment], root, now);
+    const path = join(root, "2026-03-15-_creator.json");
+    const entry = JSON.parse(await readFile(path, "utf8")) as {
+      comments: CommentRecord[];
+    };
+    expect(entry.comments[0]).toMatchObject({
+      text: cachedComment.text,
+      likeCount: 17,
+      commentId: "c1",
+    });
+  });
+
   it("deletes cache files older than 30 days and keeps newer entries", async () => {
     const root = join(await getTempRoot(), "cache");
     await mkdir(root, { recursive: true });
@@ -1024,17 +1048,21 @@ describe("debug dump retention", () => {
     await mkdir(debugFolder, { recursive: true });
     const oldDump = join(debugFolder, "batch-1-prompt.txt");
     const recentDump = join(debugFolder, "batch-2-response.txt");
+    const oldYoutubeSample = join(debugFolder, "youtube-sample.json");
     const unrelated = join(debugFolder, "notes.txt");
     await Promise.all([
       writeFile(oldDump, "old"),
       writeFile(recentDump, "recent"),
+      writeFile(oldYoutubeSample, "[]"),
       writeFile(unrelated, "keep"),
     ]);
     const now = new Date("2026-03-15T00:00:00Z");
     const oldDate = new Date(now.getTime() - 31 * 86_400_000);
     await utimes(oldDump, oldDate, oldDate);
-    expect(await purgeOldDebugDumps(root, now)).toBe(1);
+    await utimes(oldYoutubeSample, oldDate, oldDate);
+    expect(await purgeOldDebugDumps(root, now)).toBe(2);
     await expect(readFile(oldDump)).rejects.toThrow();
+    await expect(readFile(oldYoutubeSample)).rejects.toThrow();
     await expect(readFile(recentDump, "utf8")).resolves.toBe("recent");
     await expect(readFile(unrelated, "utf8")).resolves.toBe("keep");
   });
