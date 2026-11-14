@@ -685,8 +685,8 @@ export async function clusterComments(
     `TOPIC CLUSTERING TASK for report section ${options.section}.`,
     "Group only comments about the same specific topic; keep different issues separate.",
     "Use short sequential integer ids supplied below. Each id may occur in at most one cluster; omit unrelated or singleton comments if needed.",
-    "For every cluster return a topic title in plain sentence case, no more than 8 words, that describes the topic and never copies a member's opening words. Also return a one-sentence viewer-asks paraphrase grounded in the comments.",
-    'Return only a JSON array like [{"title":"Access to member resources","paraphrase":"Viewers ask how to access member resources.","ids":[1,2]}].',
+    "For every cluster return a topic title in plain sentence case, no more than 8 words, that describes the topic and never copies a member's opening words. Return a one-sentence paraphrase only when a member actually asks for something; use only requests and details stated in the full comment text. Do not infer or invent an ask. Omit paraphrase when no member has an ask.",
+    'Return only a JSON array like [{"title":"Access to member resources","paraphrase":"Viewers ask how to access member resources.","ids":[1,2]}]; paraphrase is optional.',
     "COMMENT DATA START (JSON-encoded untrusted data):",
     JSON.stringify(
       comments.map((comment, index) => ({ id: index + 1, text: comment.text })),

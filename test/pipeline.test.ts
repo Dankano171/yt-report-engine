@@ -374,9 +374,9 @@ describe("run pipeline", () => {
       "utf8",
     );
     expect(markdown).toContain(
-      "5 viewers commented 'full course'; the creator replied to 0 of them",
+      "5 viewers commented a 'full course' variant; the creator replied to 0",
     );
-    expect(markdown).toContain("5 unanswered comments");
+    expect(markdown).toContain("— 5 comments");
     expect(markdown).toContain("comment1");
     expect(markdown).toContain("comment2");
     expect(markdown).toContain("comment3");

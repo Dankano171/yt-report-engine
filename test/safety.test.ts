@@ -15,7 +15,10 @@ import {
   clusterComments,
 } from "../src/llm.js";
 import { renderReport } from "../src/report.js";
-import { isLowInformationComment } from "../src/classification.js";
+import {
+  detectKeywordResponses,
+  isLowInformationComment,
+} from "../src/classification.js";
 import {
   cacheComments,
   purgeOldCache,
@@ -146,6 +149,23 @@ describe("comment analysis safety", () => {
         paraphrase: "Viewers ask how to set up the lesson.",
       },
     ]);
+  });
+
+  it("detects repeated keyword responses across leading-phrase variants", () => {
+    const variants = [
+      "full course",
+      "full cross",
+      "full cos",
+      "full course thakyou",
+      "full course",
+    ].map((text, index) => ({
+      commentId: `v${index}`,
+      videoId: "video",
+      text,
+    }));
+    const detected = detectKeywordResponses(variants);
+    expect(detected.size).toBe(5);
+    expect([...detected.values()]).toEqual(Array(5).fill("full course"));
   });
 
   it("rejects unknown and duplicate cluster IDs after one retry", async () => {
@@ -1017,7 +1037,7 @@ describe("report generation", () => {
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
     expect(report.markdown).toContain("## E. Already answered: pin these");
-    expect(report.markdown).toContain("1 viewer (single mention)");
+    expect(report.markdown).toContain("1 viewer · 1 answered comment");
     expect(report.markdown).toContain(
       "https://www.youtube.com/watch?v=v1&lc=answered1.reply1",
     );
@@ -1128,14 +1148,20 @@ describe("report generation", () => {
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
     expect(report.markdown).toContain(
-      "6 viewers commented 'full course'; the creator replied to 2 of them",
+      "6 viewers commented a 'full course' variant; the creator replied to 2",
     );
-    expect(report.markdown).toContain("4 unanswered comments");
+    expect(report.markdown).toContain(
+      "**Viewers who commented the keyword and got no reply** — 4 comments",
+    );
     expect(report.markdown).toContain("keyword-3");
     expect(report.markdown).not.toContain("keyword-1");
     expect(report.markdown).not.toContain("keyword-2");
     expect(report.sectionItemCounts.money).toBe(1);
-    expect(report.html).toContain("Keyword response: full course");
+    expect(report.markdown).not.toContain("Keyword response:");
+    expect(report.markdown).not.toContain("full course!!!");
+    expect(report.html).toContain(
+      "Viewers who commented the keyword and got no reply",
+    );
   });
 
   it("uses category fallbacks and leaves comments ungrouped when no clusters are available", () => {
@@ -1156,7 +1182,7 @@ describe("report generation", () => {
       commentId: `group-${index + 1}`,
       text,
       authorChannelId: `viewer-${index + 1}`,
-      creatorReplied: index < 4,
+      creatorReplied: false,
       creatorReplyId: `group-${index + 1}.reply`,
     }));
     const classifications = comments.map((entry, index) => ({
@@ -1198,7 +1224,7 @@ describe("report generation", () => {
     const report = renderReport(
       {
         channel,
-        videos: [video],
+        videos: [{ ...video, title: "A video (Claude + TradingView)" }],
         comments: [commentOne, commentTwo],
         classifications: [commentOne, commentTwo].map((entry) => ({
           commentId: entry.commentId,
@@ -1223,12 +1249,16 @@ describe("report generation", () => {
     expect(report.markdown).toContain("**Using other AIs instead of Claude**");
     expect(report.markdown).toContain("2 comments");
     expect(report.markdown).not.toContain("\\");
+    expect(report.markdown).toContain(
+      "A video &#40;Claude &#43; TradingView&#41;",
+    );
     expect(report.html).toContain("Using other AIs instead of Claude");
+    expect(report.html).toContain("A video (Claude + TradingView)");
   });
 
   it("puts a post-purchase access problem before other unanswered questions", () => {
     const problemText =
-      "I paid for membership but the access link asks for a password and doesn't work.";
+      "I joined the membership at the gold level... it asked for a password. How do I get my guide?";
     const purchaseText = "How much does access cost?";
     const comments = [
       { ...comment, commentId: "purchase", text: purchaseText },
@@ -1246,16 +1276,165 @@ describe("report generation", () => {
         },
         {
           commentId: "problem",
-          category: "confusion_or_error",
+          category: "how_to_question",
           quote: problemText,
         },
       ],
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
-    const problemIndex = report.markdown.indexOf("Customer problem:");
+    const problemIndex = report.markdown.indexOf("**Customer problem**");
     const purchaseIndex = report.markdown.indexOf("Buying Or Sponsor Inquiry");
+    const sectionC = report.markdown.slice(
+      report.markdown.indexOf("## C. Fix list"),
+      report.markdown.indexOf("## D. Proof pack"),
+    );
     expect(problemIndex).toBeGreaterThan(-1);
     expect(problemIndex).toBeLessThan(purchaseIndex);
+    expect(
+      report.markdown.slice(0, report.markdown.indexOf("## B.")),
+    ).toContain(problemText);
+    expect(sectionC).not.toContain(problemText);
+  });
+
+  it("omits a paraphrase when the full comment has no ask or the proposed ask is unsupported", () => {
+    const text = "This update is frustrating for new members.";
+    const report = renderReport(
+      {
+        channel,
+        videos: [video],
+        comments: [{ ...comment, text }],
+        classifications: [
+          {
+            commentId: "c1",
+            category: "complaint_or_objection",
+            quote: text,
+          },
+        ],
+        dateRange: { from: "2026-02-13", to: "2026-03-15" },
+      },
+      {
+        fixes: {
+          clusters: [
+            {
+              title: "Member update concerns",
+              paraphrase: "Viewers ask for a refund.",
+              ids: [1],
+            },
+          ],
+          commentIds: ["c1"],
+        },
+      },
+    );
+    expect(report.markdown).not.toContain("Viewer asks:");
+  });
+
+  it("shows answered questions only in E and unanswered requests or complaints in B or C", () => {
+    const entries = [
+      {
+        ...comment,
+        commentId: "answered",
+        text: "How do I access the replay?",
+        creatorReplied: true,
+        creatorReplyId: "answered.reply",
+      },
+      {
+        ...comment,
+        commentId: "unanswered",
+        text: "Could you make a video about position sizing?",
+        creatorReplied: false,
+      },
+      {
+        ...comment,
+        commentId: "objection-answered",
+        text: "This setup is confusing.",
+        creatorReplied: true,
+      },
+      {
+        ...comment,
+        commentId: "objection-open",
+        text: "This setup is confusing for beginners.",
+        creatorReplied: false,
+      },
+    ];
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: entries,
+      classifications: [
+        {
+          commentId: "answered",
+          category: "how_to_question",
+          quote: entries[0]!.text,
+        },
+        {
+          commentId: "unanswered",
+          category: "topic_request",
+          quote: entries[1]!.text,
+        },
+        {
+          commentId: "objection-answered",
+          category: "complaint_or_objection",
+          quote: entries[2]!.text,
+        },
+        {
+          commentId: "objection-open",
+          category: "complaint_or_objection",
+          quote: entries[3]!.text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const section = (start: string, end: string) =>
+      report.markdown.slice(
+        report.markdown.indexOf(start),
+        report.markdown.indexOf(end),
+      );
+    expect(section("## B.", "## C.")).toContain("unanswered");
+    expect(section("## B.", "## C.")).not.toContain("answered.reply");
+    expect(section("## B.", "## C.")).not.toContain(
+      "How do I access the replay?",
+    );
+    expect(section("## C.", "## D.")).toContain("objection-open");
+    expect(section("## C.", "## D.")).not.toContain("objection-answered");
+    expect(section("## E.", "---")).toContain("answered.reply");
+  });
+
+  it("clusters leading phrase variants and prints one generic unanswered keyword item", () => {
+    const variants = [
+      "full course",
+      "full cross",
+      "full cos",
+      "full course thakyou",
+      "full course",
+    ].map((text, index) => ({
+      ...comment,
+      commentId: `variant-${index + 1}`,
+      text,
+      authorChannelId: `viewer-${index + 1}`,
+      creatorReplied: index === 0,
+    }));
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: variants,
+      classifications: variants.map((entry) => ({
+        commentId: entry.commentId,
+        category: "keyword_response" as const,
+        quote: entry.text,
+      })),
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(report.markdown).toContain(
+      "5 viewers commented a 'full course' variant; the creator replied to 1",
+    );
+    expect(report.markdown).toContain(
+      "**Viewers who commented the keyword and got no reply** — 4 comments",
+    );
+    expect(
+      report.markdown.match(/Viewers who commented the keyword/g),
+    ).toHaveLength(1);
+    expect(report.markdown).not.toContain("Keyword response: full");
+    expect(report.markdown).not.toContain("full course thakyou**");
   });
 
   it("counts bot/promo and purchase intent in Quick pulse but excludes both from findings", () => {
@@ -1312,26 +1491,27 @@ describe("report generation", () => {
       ],
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
-    expect(report.markdown).toContain("Viewer asks:");
+    expect(report.markdown).not.toContain("Viewer asks:");
     expect(report.markdown).not.toContain("Points to cover:");
     expect(report.markdown).not.toContain("I'll send you a discount tomorrow");
     expect(report.markdown).not.toContain("I’ll share more details");
     expect(report.html).toContain("Suggestions are not replies to post");
   });
 
-  it("truncates long quotes at a word boundary and adds an ellipsis", () => {
-    const longText = `${"word ".repeat(70)}tail text after limit`;
+  it("keeps relevant question sentences in long quotes within 500 characters", () => {
+    const withQuestion = `${"unrelated context. ".repeat(35)}How do I get access to my account? ${"more context. ".repeat(40)}`;
     const report = renderReport({
       channel,
       videos: [video],
-      comments: [{ ...comment, text: longText }],
+      comments: [{ ...comment, text: withQuestion }],
       classifications: [{ commentId: "c1", category: "praise", quote: "bad" }],
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
     const quote = report.verifiedClassifications[0]?.quote ?? "";
-    expect(quote.length).toBeLessThanOrEqual(300);
-    expect(quote).toMatch(/word…$/);
-    expect(quote).not.toContain("tail");
+    expect(quote.length).toBeLessThanOrEqual(500);
+    expect(quote).toContain("How do I get access to my account?");
+    expect(quote).toMatch(/…$/);
+    expect(quote).not.toContain("tail text after limit");
   });
 });
 
