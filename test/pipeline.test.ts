@@ -106,6 +106,7 @@ function partiallyClassifyingFetcher(
             firstResponseIds.map((id) => ({
               id,
               category: "how_to_question",
+              confidence: 0.9,
               timestamp: null,
             })),
           )
@@ -131,11 +132,12 @@ function categorizedFetcher(texts: string[], categories: string[]): Fetcher {
     const dataJsonStart = prompt.indexOf("\n", dataStart) + 1;
     const suppliedComments = JSON.parse(
       prompt.slice(dataJsonStart, dataEnd).trim(),
-    ) as { id: number }[];
+    ) as { id: number; text: string }[];
     const content = JSON.stringify(
-      suppliedComments.map(({ id }) => ({
+      suppliedComments.map(({ id, text }) => ({
         id,
-        category: categories[id - 1],
+        category: categories[texts.indexOf(text)],
+        confidence: 0.9,
         timestamp: null,
       })),
     );
@@ -182,6 +184,9 @@ describe("run pipeline", () => {
     await expect(
       readFile(join(result.reportFolder, "report.html"), "utf8"),
     ).resolves.toContain("Audience intelligence");
+    await expect(
+      readFile(join(result.reportFolder, "report-full.md"), "utf8"),
+    ).resolves.toContain("## This week");
     const stats = JSON.parse(
       await readFile(join(result.reportFolder, "stats.json"), "utf8"),
     ) as {
@@ -228,6 +233,8 @@ describe("run pipeline", () => {
       "Great explanation",
     ];
     const baseFetcher = categorizedFetcher(texts, [
+      "",
+      "",
       "buying_or_sponsor_inquiry",
       "complaint",
       "topic_request",
@@ -447,6 +454,7 @@ describe("run pipeline", () => {
                   supplied.map(({ id }) => ({
                     id,
                     category: "how_to_question",
+                    confidence: 0.9,
                     timestamp: null,
                   })),
                 ),
@@ -484,7 +492,7 @@ describe("run pipeline", () => {
       ),
     );
     const markdown = await readFile(
-      join(result.reportFolder, "report.md"),
+      join(result.reportFolder, "report-full.md"),
       "utf8",
     );
     expect(markdown.match(/Topic specifics number \d+/g)).toHaveLength(19);
@@ -539,6 +547,7 @@ describe("run pipeline", () => {
                       Array.from({ length: 4 }, (_, index) => ({
                         id: index + 1,
                         category: "how_to_question",
+                        confidence: 0.9,
                         timestamp: null,
                       })),
                     ),
@@ -687,7 +696,11 @@ describe("run pipeline", () => {
             {
               message: {
                 content: JSON.stringify(
-                  items.map(({ id }) => ({ id, category: "spam_or_noise" })),
+                  items.map(({ id }) => ({
+                    id,
+                    category: "spam_or_noise",
+                    confidence: 0.9,
+                  })),
                 ),
               },
             },

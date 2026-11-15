@@ -6,6 +6,7 @@ export type Category =
   | "how_to_question"
   | "confusion_or_error"
   | "complaint_or_objection"
+  | "viewer_tip"
   | "testimonial_or_result"
   | "topic_request"
   | "language_or_subtitles_request"
@@ -82,10 +83,15 @@ export interface Classification {
   commentId: string;
   category: Category;
   quote: string;
+  confidence: number;
   timestamp?: string;
   draftReply?: string;
   idea?: string;
 }
+
+export type ClassificationInput = Omit<Classification, "confidence"> & {
+  confidence?: number;
+};
 
 export interface UsageRecord {
   date: string;

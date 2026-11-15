@@ -2,6 +2,7 @@ import type {
   Category,
   ChannelConfig,
   Classification,
+  ClassificationInput,
   CommentRecord,
   VideoRecord,
 } from "./types.js";
@@ -19,7 +20,7 @@ export interface ReportInput {
   channel: ChannelConfig;
   videos: VideoRecord[];
   comments: CommentRecord[];
-  classifications: Classification[];
+  classifications: ClassificationInput[];
   dateRange: { from: string; to: string };
   classificationSucceeded?: boolean;
   stoppedReason?: string;
@@ -65,7 +66,9 @@ export interface RenderedReport {
     keywordGroup: number;
     purchaseIntent: number;
     praise: number;
+    viewerTip: number;
   };
+  fullMarkdown: string;
   titleFallbacks: Partial<
     Record<ReportSection, { count: number; reason: string }>
   >;
@@ -120,6 +123,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "how_to_question",
       "confusion_or_error",
       "complaint_or_objection",
+      "viewer_tip",
       "topic_request",
       "language_or_subtitles_request",
       "alternative_or_tool_request",
@@ -137,6 +141,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "how_to_question",
       "testimonial_or_result",
       "complaint_or_objection",
+      "viewer_tip",
       "topic_request",
       "language_or_subtitles_request",
       "alternative_or_tool_request",
@@ -155,6 +160,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "how_to_question",
       "complaint_or_objection",
       "confusion_or_error",
+      "viewer_tip",
       "topic_request",
       "language_or_subtitles_request",
       "alternative_or_tool_request",
@@ -172,6 +178,7 @@ function goalOrder(channel: ChannelConfig): Category[] {
       "praise",
       "confusion_or_error",
       "complaint_or_objection",
+      "viewer_tip",
       "buying_or_sponsor_inquiry",
       "language_or_subtitles_request",
       "alternative_or_tool_request",
@@ -269,6 +276,15 @@ const requestCategories = new Set<Category>([
   "mentoring_or_personal_request",
 ]);
 
+const LOW_CONFIDENCE_THRESHOLD = 0.65;
+
+function isLowConfidence(finding: Finding): boolean {
+  return (
+    finding.classification.confidence !== undefined &&
+    finding.classification.confidence < LOW_CONFIDENCE_THRESHOLD
+  );
+}
+
 function isActionableMoney(finding: Finding): boolean {
   const { classification, comment } = finding;
   const topicNeedsCreatorAction =
@@ -280,7 +296,9 @@ function isActionableMoney(finding: Finding): boolean {
       comment.text,
     );
   return (
+    !isLowConfidence(finding) &&
     !comment.creatorReplied &&
+    classification.category !== "viewer_tip" &&
     classification.category !== "mentoring_or_personal_request" &&
     (isCustomerProblem(finding) ||
       (classification.category === "buying_or_sponsor_inquiry" &&
@@ -308,13 +326,24 @@ function isCustomerProblem(finding: Finding): boolean {
 function isFix(finding: Finding): boolean {
   const { classification, comment } = finding;
   return (
+    !isLowConfidence(finding) &&
     !comment.creatorReplied &&
+    classification.category !== "viewer_tip" &&
     !isCustomerProblem(finding) &&
     (classification.category === "confusion_or_error" ||
       classification.category === "complaint_or_objection" ||
       /\b(link|broken|doesn.t work|can.t find|password|access problem)\b/i.test(
         comment.text,
       ))
+  );
+}
+
+function suggestsFutureVideo(finding: Finding): boolean {
+  return (
+    finding.classification.category === "viewer_tip" &&
+    /\b(?:future|next)\s+(?:video|episode)\b|\b(?:video|episode|tutorial|recipe)\s+(?:on|about|showing)\b|\b(?:cover|show|demonstrate|teach|explain)\b|\b(?:would love to (?:know|see|learn)|you should|you could|could you|can you)\b/i.test(
+      finding.comment.text,
+    )
   );
 }
 
@@ -326,7 +355,8 @@ function isAnsweredQuestion(finding: Finding): boolean {
     finding.classification.category !== "keyword_response" &&
     finding.classification.category !== "purchase_intent" &&
     finding.classification.category !== "praise" &&
-    finding.classification.category !== "testimonial_or_result"
+    finding.classification.category !== "testimonial_or_result" &&
+    finding.classification.category !== "viewer_tip"
   );
 }
 
@@ -362,7 +392,7 @@ export async function clusterReportSections(
     ideas: findings
       .filter(
         (finding) =>
-          isUnansweredRequest(finding) &&
+          (isUnansweredRequest(finding) || suggestsFutureVideo(finding)) &&
           !moneyIds.has(finding.comment.commentId),
       )
       .map((finding) => finding.comment),
@@ -515,6 +545,7 @@ function findingList(input: ReportInput): {
       classification: {
         ...classification,
         quote: truncateQuote(comment.text),
+        confidence: classification.confidence ?? 1,
       },
       comment,
       video,
@@ -749,6 +780,7 @@ function renderMarkdown(
   clusters: ReportClusters = {},
 ): {
   markdown: string;
+  fullMarkdown: string;
   sectionItemCounts: RenderedReport["sectionItemCounts"];
   reportDestinationCounts: RenderedReport["reportDestinationCounts"];
   titleFallbacks: RenderedReport["titleFallbacks"];
@@ -815,6 +847,11 @@ function renderMarkdown(
     "ideas",
     clusters,
   );
+  const viewerSuggestions = groupsForSection(
+    ordered.filter(suggestsFutureVideo),
+    "ideas",
+    clusters,
+  );
   const requestIds = new Set(
     requests.flatMap((group) =>
       group.findings.map(({ comment }) => comment.commentId),
@@ -856,6 +893,7 @@ function renderMarkdown(
     praise: 0,
     requests: 0,
     objections: 0,
+    viewerTips: 0,
     noise: 0,
     botOrPromo: 0,
     purchaseIntent: 0,
@@ -876,6 +914,7 @@ function renderMarkdown(
     )
       quickPulseCounts.questions += 1;
     if (category === "praise") quickPulseCounts.praise += 1;
+    if (category === "viewer_tip") quickPulseCounts.viewerTips += 1;
     if (
       category === "topic_request" ||
       category === "language_or_subtitles_request" ||
@@ -903,6 +942,21 @@ function renderMarkdown(
         : "";
     const viewerAsk = groundedParaphrase(group);
     return `- **${title}** — ${countLabel} · ${group.findings.length} comment${group.findings.length === 1 ? "" : "s"}${viewerAsk ? `\n\nViewer asks: ${paraphrase(group)}` : ""}\n\n${examples
+      .map(
+        (finding) =>
+          `[Open comment](${finding.link}) on **${escapeMarkdown(finding.video.title)}**\n\n${quoteBlock(finding.classification.quote)}`,
+      )
+      .join("\n\n")}${more}`;
+  });
+  const viewerSuggestionItems = viewerSuggestions.map((group) => {
+    const title = cleanTitle(group.title ?? "Viewer suggestion");
+    const countLabel = `${viewerLabel(group.viewers)}${group.viewers === 1 ? " (single mention)" : ""}`;
+    const examples = group.findings.slice(0, 3);
+    const more =
+      group.findings.length > examples.length
+        ? `\n\n  and ${group.findings.length - examples.length} more`
+        : "";
+    return `- **${title}** — ${countLabel} · ${group.findings.length} comment${group.findings.length === 1 ? "" : "s"}\n\n${examples
       .map(
         (finding) =>
           `[Open comment](${finding.link}) on **${escapeMarkdown(finding.video.title)}**\n\n${quoteBlock(finding.classification.quote)}`,
@@ -961,7 +1015,9 @@ function renderMarkdown(
       )}${more}\n\n        **Suggestion:** Consider pinning an answer or adding an FAQ entry.`;
   });
   const unansweredKeywordResponses = keywordResponseGroups.flatMap((group) =>
-    group.findings.filter((finding) => !finding.comment.creatorReplied),
+    group.findings.filter(
+      (finding) => !finding.comment.creatorReplied && !isLowConfidence(finding),
+    ),
   );
   const keywordResponseItem =
     unansweredKeywordResponses.length > 0
@@ -1001,7 +1057,7 @@ function renderMarkdown(
   ];
   const sectionItemCounts = {
     money: moneyItems.length,
-    ideas: requests.length,
+    ideas: requests.length + viewerSuggestions.length,
     fixes: fixes.length,
     proofs: proofs.length,
     answered: answeredItems.length,
@@ -1016,6 +1072,7 @@ function renderMarkdown(
     keywordGroup: 0,
     purchaseIntent: 0,
     praise: 0,
+    viewerTip: 0,
   };
   const findingById = new Map(
     findings.map((finding) => [finding.comment.commentId, finding]),
@@ -1036,6 +1093,8 @@ function renderMarkdown(
       reportDestinationCounts.keywordGroup += 1;
     } else if (classification.category === "purchase_intent") {
       reportDestinationCounts.purchaseIntent += 1;
+    } else if (classification.category === "viewer_tip") {
+      reportDestinationCounts.viewerTip += 1;
     } else if (classification.category === "praise") {
       reportDestinationCounts.praise += 1;
     } else if (classification.category === "testimonial_or_result") {
@@ -1053,7 +1112,7 @@ function renderMarkdown(
   const titleFallbacks: RenderedReport["titleFallbacks"] = {};
   const fallbackGroups: [ReportSection, FindingGroup[]][] = [
     ["money", otherMoneyGroups],
-    ["ideas", requests],
+    ["ideas", [...requests, ...viewerSuggestions]],
     ["fixes", fixes],
     ["proofs", proofs],
     ["answered", answeredQuestions],
@@ -1074,86 +1133,152 @@ function renderMarkdown(
   const incompleteMessage =
     "_Not reported because classification did not complete successfully._";
   const enough = input.videos.length > 0 || input.comments.length > 0;
-  const sections = [
-    `# ${escapeMarkdown(input.channel.creatorName)} — Audience intelligence`,
-    "",
-    "> **How to read this:** Viewer quotes and counts are from public comments. Suggestions are not replies to post; review details against source material.",
-    input.stoppedReason ? `\n> **Analysis note:** ${input.stoppedReason}` : "",
-    "",
-    "## Quick pulse",
-    `- Comments analyzed: ${input.comments.length}`,
-    `- Questions: ${share(quickPulseCounts.questions)}`,
-    `- Praise: ${share(quickPulseCounts.praise)}`,
-    `- Requests: ${share(quickPulseCounts.requests)}`,
-    `- Objections: ${share(quickPulseCounts.objections)}`,
-    `- Noise: ${share(quickPulseCounts.noise)}`,
-    `- Suspected bot/promo: ${share(quickPulseCounts.botOrPromo)}`,
-    `- Purchase intent: ${share(quickPulseCounts.purchaseIntent)}`,
-    ...keywordResponseGroups.map((group) => {
-      const repliedCount = group.findings.filter(
-        (finding) => finding.comment.creatorReplied,
-      ).length;
-      return `- ${viewerLabel(group.viewers)} commented a '${escapeMarkdown(group.phrase)}' variant; the creator replied to ${repliedCount}`;
-    }),
-    `- Creator replied: ${share(input.comments.filter((comment) => comment.creatorReplied).length)}`,
-    input.classificationSucceeded === false
-      ? "_Classification incomplete; category shares may be partial._"
-      : "",
-    "",
-    "## A. Money on the table",
-    moneyItems.length
-      ? moneyItems.join("\n\n")
-      : input.classificationSucceeded === false
-        ? incompleteMessage
-        : "_No unanswered purchase/sponsor inquiry, high-like question, or keyword response found in the analyzed comments._",
-    "",
-    "## B. Requests and ideas",
-    requestItems.length
-      ? requestItems.join("\n\n")
-      : input.classificationSucceeded === false
-        ? incompleteMessage
-        : "_No questions or viewer requests found._",
-    "",
-    "## C. Fix list",
-    fixItems.length
-      ? fixItems.join("\n\n")
-      : input.classificationSucceeded === false
-        ? incompleteMessage
-        : "_No confusion, issue, or objection identified._",
-    "",
-    "## D. Proof pack",
-    proofs.length
-      ? proofs
-          .map(
-            (group) =>
-              `- ${group.findings.length} proof comment${group.findings.length === 1 ? "" : "s"}${group.findings.length > 3 ? `; and ${group.findings.length - 3} more` : ""}\n\n${group.findings
-                .slice(0, 3)
-                .map(markdownFinding)
-                .join("\n\n")}`,
-          )
-          .join("\n\n")
-      : input.classificationSucceeded === false
-        ? incompleteMessage
-        : "_No testimonial or result comment identified._",
-    "",
-    "## E. Already answered: pin these",
-    answeredItems.length
-      ? answeredItems.join("\n\n")
-      : input.classificationSucceeded === false
-        ? incompleteMessage
-        : "_No repeated or high-like answered question found._",
-    "",
-    !enough
-      ? "_Not enough data: no recent public videos or public comments were available to analyze._"
-      : input.comments.length === 0
-        ? "_Not enough data: recent videos were found, but no public comments were available to analyze._"
+  const summaryValue = (group: FindingGroup | undefined) =>
+    group
+      ? `${cleanTitle(group.title ?? "Viewer feedback")} (${group.findings.length} comment${group.findings.length === 1 ? "" : "s"})`
+      : "None identified";
+  const salesLead = otherMoneyGroups[0];
+  const biggestObjection = [...fixes]
+    .filter((group) =>
+      group.findings.some(
+        ({ classification }) =>
+          classification.category === "complaint_or_objection",
+      ),
+    )
+    .sort(
+      (left, right) =>
+        right.findings.length - left.findings.length ||
+        right.findings.reduce((sum, item) => sum + item.comment.likeCount, 0) -
+          left.findings.reduce((sum, item) => sum + item.comment.likeCount, 0),
+    )[0];
+  const bestProof = proofs[0];
+  const proofItems = proofs.map(
+    (group) =>
+      `- ${group.findings.length} proof comment${group.findings.length === 1 ? "" : "s"}${group.findings.length > 3 ? `; and ${group.findings.length - 3} more` : ""}\n\n${group.findings
+        .slice(0, 3)
+        .map(markdownFinding)
+        .join("\n\n")}`,
+  );
+  const sectionList = (items: string[], full: boolean) => {
+    const displayedItems = full ? items : items.slice(0, 5);
+    const remaining = full
+      ? 0
+      : Math.max(0, items.length - displayedItems.length);
+    return [
+      ...displayedItems,
+      ...(remaining ? [`and ${remaining} more`] : []),
+    ].join("\n\n");
+  };
+  const ideasSection = (full: boolean) => {
+    const requestCount = full
+      ? requestItems.length
+      : Math.min(5, requestItems.length);
+    const suggestionCount = full
+      ? viewerSuggestionItems.length
+      : Math.min(5 - requestCount, viewerSuggestionItems.length);
+    const remaining = full
+      ? 0
+      : Math.max(0, requestItems.length + viewerSuggestionItems.length - 5);
+    return [
+      ...(requestCount
+        ? [
+            "### Requests and ideas",
+            requestItems.slice(0, requestCount).join("\n\n"),
+          ]
+        : []),
+      ...(suggestionCount
+        ? [
+            "### Viewer suggestions",
+            viewerSuggestionItems.slice(0, suggestionCount).join("\n\n"),
+          ]
+        : []),
+      ...(remaining ? [`and ${remaining} more`] : []),
+    ].join("\n\n");
+  };
+  const renderMarkdownVariant = (full: boolean) => {
+    const sections = [
+      `# ${escapeMarkdown(input.channel.creatorName)} — Audience intelligence`,
+      "",
+      "## This week",
+      `- Biggest sales lead: ${summaryValue(salesLead)}`,
+      `- Biggest objection: ${summaryValue(biggestObjection)}`,
+      `- Best proof: ${summaryValue(bestProof)}`,
+      "",
+      "> **How to read this:** Viewer quotes and counts are from public comments. Suggestions are not replies to post; review details against source material.",
+      input.stoppedReason
+        ? `\n> **Analysis note:** ${input.stoppedReason}`
         : "",
-    "",
-    `---\nDate range: ${input.dateRange.from} to ${input.dateRange.to} · Videos analyzed (${input.videos.length}): ${videoNames}\n\nYou received this because you opted in. To unsubscribe, reply to the email asking to be removed.`,
-    "",
-  ];
+      "",
+      "## Quick pulse",
+      `- Comments analyzed: ${input.comments.length}`,
+      `- Questions: ${share(quickPulseCounts.questions)}`,
+      `- Praise: ${share(quickPulseCounts.praise)}`,
+      `- Viewer tips: ${share(quickPulseCounts.viewerTips)}`,
+      `- Requests: ${share(quickPulseCounts.requests)}`,
+      `- Objections: ${share(quickPulseCounts.objections)}`,
+      `- Noise: ${share(quickPulseCounts.noise)}`,
+      `- Suspected bot/promo: ${share(quickPulseCounts.botOrPromo)}`,
+      `- Purchase intent: ${share(quickPulseCounts.purchaseIntent)}`,
+      ...keywordResponseGroups.map((group) => {
+        const repliedCount = group.findings.filter(
+          (finding) => finding.comment.creatorReplied,
+        ).length;
+        return `- ${viewerLabel(group.viewers)} commented a '${escapeMarkdown(group.phrase)}' variant; the creator replied to ${repliedCount}`;
+      }),
+      `- Creator replied: ${share(input.comments.filter((comment) => comment.creatorReplied).length)}`,
+      input.classificationSucceeded === false
+        ? "_Classification incomplete; category shares may be partial._"
+        : "",
+      "",
+      "## A. No written reply",
+      moneyItems.length
+        ? sectionList(moneyItems, full)
+        : input.classificationSucceeded === false
+          ? incompleteMessage
+          : "_No unanswered purchase/sponsor inquiry, high-like question, or keyword response found in the analyzed comments._",
+      "",
+      "## B. Requests and ideas",
+      requestItems.length || viewerSuggestionItems.length
+        ? ideasSection(full)
+        : input.classificationSucceeded === false
+          ? incompleteMessage
+          : "_No questions or viewer requests found._",
+      "",
+      "## C. Fix list",
+      fixItems.length
+        ? sectionList(fixItems, full)
+        : input.classificationSucceeded === false
+          ? incompleteMessage
+          : "_No confusion, issue, or objection identified._",
+      "",
+      "## D. Proof pack",
+      proofItems.length
+        ? sectionList(proofItems, full)
+        : input.classificationSucceeded === false
+          ? incompleteMessage
+          : "_No testimonial or result comment identified._",
+      "",
+      "## E. Already answered: pin these",
+      answeredItems.length
+        ? sectionList(answeredItems, full)
+        : input.classificationSucceeded === false
+          ? incompleteMessage
+          : "_No repeated or high-like answered question found._",
+      "",
+      !enough
+        ? "_Not enough data: no recent public videos or public comments were available to analyze._"
+        : input.comments.length === 0
+          ? "_Not enough data: recent videos were found, but no public comments were available to analyze._"
+          : "",
+      "",
+      `---\nDate range: ${input.dateRange.from} to ${input.dateRange.to} · Videos analyzed (${input.videos.length}): ${videoNames}\n\nCreator hearts are not visible to this analysis; 'no reply' means no written reply.\n\nYou received this because you opted in. To unsubscribe, reply to the email asking to be removed.`,
+      "",
+    ];
+    return sections.filter((section) => section !== "").join("\n");
+  };
   return {
-    markdown: sections.filter((section) => section !== "").join("\n"),
+    markdown: renderMarkdownVariant(false),
+    fullMarkdown: renderMarkdownVariant(true),
     sectionItemCounts,
     reportDestinationCounts,
     titleFallbacks,
@@ -1253,6 +1378,7 @@ export function renderReport(
   return {
     markdown: rendered.markdown,
     html: markdownToHtml(rendered.markdown),
+    fullMarkdown: rendered.fullMarkdown,
     verifiedClassifications: verification.findings.map(
       (finding) => finding.classification,
     ),

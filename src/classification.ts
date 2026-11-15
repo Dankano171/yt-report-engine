@@ -8,12 +8,15 @@ const lowInformationPhrases = new Set([
 ]);
 
 export function normalizeKeywordResponse(text: string): string {
-  return text
+  const normalized = text
     .normalize("NFKC")
     .toLowerCase()
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/gu, " ")
     .replace(/[^\p{Letter}\p{Number}\s]/gu, " ")
+    .replace(/\b\d+\b/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+  return normalized;
 }
 
 export function keywordResponseGroupKey(text: string): string {
@@ -54,6 +57,12 @@ export function detectKeywordResponses(
 ): Map<string, string> {
   const grouped = new Map<string, { id: string; phrase: string }[]>();
   for (const comment of comments) {
+    if (
+      /^\s*(?:how|what|where|when|why|who|which|can|could|would|do|does|is|are)\b/i.test(
+        comment.text,
+      )
+    )
+      continue;
     const phrase = normalizeKeywordResponse(comment.text);
     if (!phrase || phrase.split(" ").length >= 6) continue;
     const key = `${comment.videoId}\u0000${keywordResponseGroupKey(phrase)}`;

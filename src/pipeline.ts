@@ -82,6 +82,7 @@ export interface RunStats {
     keywordGroup: number;
     purchaseIntent: number;
     praise: number;
+    viewerTip: number;
   };
   titleFallbacks: Partial<
     Record<ReportSection, { count: number; reason: string }>
@@ -121,6 +122,7 @@ function emptyCategoryCounts(): Record<Category, number> {
     how_to_question: 0,
     confusion_or_error: 0,
     complaint_or_objection: 0,
+    viewer_tip: 0,
     testimonial_or_result: 0,
     topic_request: 0,
     language_or_subtitles_request: 0,
@@ -264,6 +266,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
         keywordGroup: 0,
         purchaseIntent: 0,
         praise: 0,
+        viewerTip: 0,
       },
       titleFallbacks: {},
       clustering: {
@@ -305,6 +308,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
             commentId: comment.commentId,
             category: "keyword_response" as const,
             quote: comment.text.trim(),
+            confidence: 1,
           },
         ]
       : [],
@@ -618,6 +622,9 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   await Promise.all([
     writeFile(resolve(folder, "report.html"), rendered.html, { mode: 0o600 }),
     writeFile(resolve(folder, "report.md"), rendered.markdown, { mode: 0o600 }),
+    writeFile(resolve(folder, "report-full.md"), rendered.fullMarkdown, {
+      mode: 0o600,
+    }),
   ]);
   let sent = false;
   if (options.send) {

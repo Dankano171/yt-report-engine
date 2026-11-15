@@ -122,6 +122,12 @@ describe("comment analysis safety", () => {
     );
     expect(prompt).toContain("What does it cost?");
     expect(prompt).toContain("Can my team buy access?");
+    expect(prompt).toContain("confidence must be a number from 0 to 1");
+    expect(prompt).toContain("That lumpy vegetable looks like a tiny dragon");
+    expect(prompt).toContain("I use a cotton curtain to strain the syrup");
+    expect(prompt).toContain(
+      "confusion_or_error only when the viewer explicitly says they do not understand",
+    );
     expect(prompt).toContain("COMMENT DATA END");
   });
 
@@ -295,6 +301,39 @@ describe("comment analysis safety", () => {
     expect([...detected.values()]).toEqual(Array(5).fill("full course"));
   });
 
+  it("ignores timestamps and bare numbers in keyword responses", () => {
+    const comments = [
+      "7:18",
+      "12:04:33",
+      "12345",
+      "full course 7:18",
+      "full course 123",
+    ].map((text, index) => ({
+      commentId: `keyword-${index}`,
+      videoId: "video",
+      text,
+    }));
+    expect(detectKeywordResponses(comments)).toEqual(new Map());
+    expect(
+      detectKeywordResponses(
+        Array.from({ length: 5 }, (_, index) => ({
+          commentId: `variant-${index}`,
+          videoId: "video",
+          text: `full course ${index + 1}`,
+        })),
+      ).size,
+    ).toBe(5);
+    expect(
+      detectKeywordResponses(
+        Array.from({ length: 5 }, (_, index) => ({
+          commentId: `question-${index}`,
+          videoId: "video",
+          text: `How can I apply lesson ${index + 1}?`,
+        })),
+      ),
+    ).toEqual(new Map());
+  });
+
   it("rejects unknown and duplicate cluster IDs after one retry", async () => {
     let calls = 0;
     let fallbackReason = "";
@@ -383,8 +422,8 @@ describe("comment analysis safety", () => {
           ).messages[0]?.content ?? "";
         return openAiResponse(
           JSON.stringify([
-            { id: 1, category: "question" },
-            { id: 2, category: "question" },
+            { id: 1, category: "question", confidence: 0.9 },
+            { id: 2, category: "question", confidence: 0.9 },
           ]),
         );
       },
@@ -425,7 +464,11 @@ describe("comment analysis safety", () => {
         const category =
           request.model === "primary" ? "spam_or_noise" : "how_to_question";
         const content = JSON.stringify(
-          comments.map((_, index) => ({ id: index + 1, category })),
+          comments.map((_, index) => ({
+            id: index + 1,
+            category,
+            confidence: 0.9,
+          })),
         );
         return openAiResponse(content);
       },
@@ -462,6 +505,7 @@ describe("comment analysis safety", () => {
             comments.map((_, index) => ({
               id: index + 1,
               category: "spam_or_noise",
+              confidence: 0.9,
             })),
           ),
         ),
@@ -508,7 +552,12 @@ describe("comment analysis safety", () => {
               {
                 message: {
                   content: JSON.stringify([
-                    { id: 1, category: "how_to_question", timestamp: null },
+                    {
+                      id: 1,
+                      category: "how_to_question",
+                      confidence: 0.9,
+                      timestamp: null,
+                    },
                   ]),
                 },
               },
@@ -596,13 +645,28 @@ describe("comment analysis safety", () => {
         if (prompts.length === 1)
           return openAiResponse(
             JSON.stringify([
-              { id: 1, category: "how_to_question", timestamp: null },
-              { id: 3, category: "praise", timestamp: null },
+              {
+                id: 1,
+                category: "how_to_question",
+                confidence: 0.9,
+                timestamp: null,
+              },
+              {
+                id: 3,
+                category: "praise",
+                confidence: 0.9,
+                timestamp: null,
+              },
             ]),
           );
         return openAiResponse(
           JSON.stringify([
-            { id: " 1 ", category: "confusion_or_error", timestamp: null },
+            {
+              id: " 1 ",
+              category: "confusion_or_error",
+              confidence: 0.9,
+              timestamp: null,
+            },
           ]),
         );
       },
@@ -642,7 +706,7 @@ describe("comment analysis safety", () => {
       dailyUsage: [],
       fetcher: async () =>
         openAiResponse(
-          '```json\n[{"id":" 1 ","category":"how_to_question","timestamp":null,"extra":"ignored","quote":"model-authored quote"}]\n```',
+          '```json\n[{"id":" 1 ","category":"how_to_question","confidence":0.9,"timestamp":null,"extra":"ignored","quote":"model-authored quote"}]\n```',
         ),
     });
     expect(result.classifications).toMatchObject([
@@ -690,12 +754,12 @@ describe("comment analysis safety", () => {
         if (calls === 1)
           return openAiResponse(
             JSON.stringify([
-              { id: 1, category: " Question " },
-              { id: 2, category: "unfamiliar_label" },
+              { id: 1, category: " Question ", confidence: 0.9 },
+              { id: 2, category: "unfamiliar_label", confidence: 0.9 },
             ]),
           );
         return openAiResponse(
-          JSON.stringify([{ id: 1, category: "complaint" }]),
+          JSON.stringify([{ id: 1, category: "complaint", confidence: 0.9 }]),
         );
       },
       onBatchEvent: (event) => events.push(event),
@@ -738,9 +802,9 @@ describe("comment analysis safety", () => {
       fetcher: async () =>
         openAiResponse(
           JSON.stringify([
-            { id: 1, category: "BUYING" },
-            { id: 2, category: "request" },
-            { id: 3, category: "spam" },
+            { id: 1, category: "BUYING", confidence: 0.9 },
+            { id: 2, category: "request", confidence: 0.9 },
+            { id: 3, category: "spam", confidence: 0.9 },
           ]),
         ),
     });
@@ -778,13 +842,15 @@ describe("comment analysis safety", () => {
         if (calls === 1)
           return openAiResponse(
             JSON.stringify([
-              { id: 1, category: "how_to_question" },
-              { id: 1, category: "praise" },
-              { id: 9, category: "praise" },
+              { id: 1, category: "how_to_question", confidence: 0.9 },
+              { id: 1, category: "praise", confidence: 0.9 },
+              { id: 9, category: "praise", confidence: 0.9 },
             ]),
           );
         return openAiResponse(
-          JSON.stringify([{ id: 1, category: "how_to_question" }]),
+          JSON.stringify([
+            { id: 1, category: "how_to_question", confidence: 0.9 },
+          ]),
         );
       },
       onBatchEvent: (event) => events.push(event),
@@ -872,6 +938,7 @@ describe("comment analysis safety", () => {
                           {
                             id: 1,
                             category: "how_to_question",
+                            confidence: 0.9,
                             timestamp: null,
                           },
                         ]),
@@ -954,6 +1021,7 @@ describe("comment analysis safety", () => {
                         {
                           id: 1,
                           category: "how_to_question",
+                          confidence: 0.9,
                           timestamp: null,
                         },
                       ]),
@@ -1036,7 +1104,12 @@ describe("comment analysis safety", () => {
               {
                 message: {
                   content: JSON.stringify([
-                    { id: 1, category: "how_to_question", timestamp: null },
+                    {
+                      id: 1,
+                      category: "how_to_question",
+                      confidence: 0.9,
+                      timestamp: null,
+                    },
                   ]),
                 },
               },
@@ -1049,6 +1122,30 @@ describe("comment analysis safety", () => {
     expect(result.failedBatches).toEqual([]);
     expect(result.successfulBatches).toBe(1);
     expect(result.classificationSucceeded).toBe(true);
+    expect(result.classifications[0]?.confidence).toBe(0.9);
+  });
+
+  it("retries classifications that omit confidence", async () => {
+    let calls = 0;
+    const result = await analyzeComments([comment], {
+      provider: "openai",
+      model: "test-model",
+      apiKey: "test-key",
+      maxUsdPerRun: 1,
+      maxUsdPerDay: 1,
+      dailyUsage: [],
+      fetcher: async () => {
+        calls += 1;
+        return openAiResponse(
+          JSON.stringify([
+            { id: 1, category: "how_to_question", timestamp: null },
+          ]),
+        );
+      },
+    });
+    expect(calls).toBe(2);
+    expect(result.classifications).toEqual([]);
+    expect(result.unclassifiedCount).toBe(1);
   });
 
   it("counts emoji-only comments as noise without rendering them as findings", async () => {
@@ -1076,6 +1173,184 @@ describe("comment analysis safety", () => {
 });
 
 describe("report generation", () => {
+  it("omits low-confidence purchase leads and objections from sections A and C", () => {
+    const comments = [
+      { ...comment, commentId: "low-sale", text: "How much does access cost?" },
+      {
+        ...comment,
+        commentId: "confident-sale",
+        text: "How much does the annual membership cost?",
+      },
+      {
+        ...comment,
+        commentId: "low-objection",
+        text: "This process seems too risky.",
+      },
+      {
+        ...comment,
+        commentId: "confident-objection",
+        text: "This plan is too expensive for beginners.",
+      },
+    ];
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments,
+      classifications: [
+        {
+          commentId: "low-sale",
+          category: "buying_or_sponsor_inquiry",
+          confidence: 0.64,
+          quote: comments[0]!.text,
+        },
+        {
+          commentId: "confident-sale",
+          category: "buying_or_sponsor_inquiry",
+          confidence: 0.65,
+          quote: comments[1]!.text,
+        },
+        {
+          commentId: "low-objection",
+          category: "complaint_or_objection",
+          confidence: 0.1,
+          quote: comments[2]!.text,
+        },
+        {
+          commentId: "confident-objection",
+          category: "complaint_or_objection",
+          confidence: 0.9,
+          quote: comments[3]!.text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const section = (start: string, end: string) =>
+      report.markdown.slice(
+        report.markdown.indexOf(start),
+        report.markdown.indexOf(end),
+      );
+    expect(section("## A. No written reply", "## B.")).toContain(
+      "confident-sale",
+    );
+    expect(section("## A. No written reply", "## B.")).not.toContain(
+      "low-sale",
+    );
+    expect(section("## C. Fix list", "## D.")).toContain("confident-objection");
+    expect(section("## C. Fix list", "## D.")).not.toContain("low-objection");
+    expect(report.markdown).toContain(
+      "Creator hearts are not visible to this analysis; 'no reply' means no written reply.",
+    );
+  });
+
+  it("counts viewer tips but only shows tips that suggest a future video", () => {
+    const advice = {
+      ...comment,
+      commentId: "advice",
+      text: "I use a cotton curtain to strain the syrup.",
+      creatorReplied: true,
+    };
+    const suggestion = {
+      ...comment,
+      commentId: "suggestion",
+      text: "I would love a video on cooking true yams.",
+    };
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [advice, suggestion],
+      classifications: [advice, suggestion].map((entry) => ({
+        commentId: entry.commentId,
+        category: "viewer_tip" as const,
+        quote: entry.text,
+      })),
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const ideas = report.markdown.slice(
+      report.markdown.indexOf("## B."),
+      report.markdown.indexOf("## C."),
+    );
+    expect(report.markdown).toContain("Viewer tips: 2 (100%)");
+    expect(ideas).toContain("### Viewer suggestions");
+    expect(ideas).toContain(suggestion.text);
+    expect(ideas).not.toContain(advice.text);
+    expect(report.reportDestinationCounts.viewerTip).toBe(2);
+  });
+
+  it("summarizes the week and caps each emailed section while retaining full Markdown", () => {
+    const groups = [
+      ...Array.from({ length: 6 }, (_, index) => ({
+        commentId: `money-${index}`,
+        text: `How much does access cost for account ${index}?`,
+        category: "buying_or_sponsor_inquiry" as const,
+        creatorReplied: false,
+      })),
+      ...Array.from({ length: 6 }, (_, index) => ({
+        commentId: `request-${index}`,
+        text: `Please cover the gardening topic ${index}.`,
+        category: "topic_request" as const,
+        creatorReplied: false,
+      })),
+      ...Array.from({ length: 6 }, (_, index) => ({
+        commentId: `fix-${index}`,
+        text: `This gardening issue is too difficult, number ${index}.`,
+        category: "complaint_or_objection" as const,
+        creatorReplied: false,
+      })),
+      ...Array.from({ length: 6 }, (_, index) => ({
+        commentId: `proof-${index}`,
+        text: `This tutorial helped me grow a garden ${index}.`,
+        category: "testimonial_or_result" as const,
+        creatorReplied: false,
+      })),
+      ...Array.from({ length: 6 }, (_, index) => ({
+        commentId: `answered-${index}`,
+        text: `How do I grow a garden ${index}?`,
+        category: "how_to_question" as const,
+        creatorReplied: true,
+      })),
+    ];
+    const comments = groups.map((group) => ({
+      ...comment,
+      commentId: group.commentId,
+      text: group.text,
+      creatorReplied: group.creatorReplied,
+    }));
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments,
+      classifications: groups.map((group) => ({
+        commentId: group.commentId,
+        category: group.category,
+        quote: group.text,
+      })),
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const section = (source: string, start: string, end: string) =>
+      source.slice(source.indexOf(start), source.indexOf(end));
+    expect(report.markdown).toContain("## This week");
+    expect(report.markdown).toContain("- Biggest sales lead:");
+    expect(report.markdown).toContain("- Biggest objection:");
+    expect(report.markdown).toContain("- Best proof:");
+    for (const [heading, nextHeading, lastShort, lastFull] of [
+      ["## A. No written reply", "## B.", "money-5", "money-5"],
+      ["## B.", "## C.", "request-5", "request-5"],
+      ["## C.", "## D.", "fix-5", "fix-5"],
+      ["## D.", "## E.", "proof-5", "proof-5"],
+      ["## E.", "---", "answered-5", "answered-5"],
+    ]) {
+      expect(section(report.markdown, heading!, nextHeading!)).toContain(
+        "and 1 more",
+      );
+      expect(section(report.markdown, heading!, nextHeading!)).not.toContain(
+        lastShort!,
+      );
+      expect(section(report.fullMarkdown, heading!, nextHeading!)).toContain(
+        lastFull!,
+      );
+    }
+  });
+
   it("uses the source comment as the quote even when classification quote is empty", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     const report = renderReport({
@@ -1239,7 +1514,7 @@ describe("report generation", () => {
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
     expect(report.markdown).toContain("Not enough data");
-    expect(report.html).toContain("Money on the table");
+    expect(report.html).toContain("No written reply");
     expect(report.html).toContain("Proof pack");
   });
 
