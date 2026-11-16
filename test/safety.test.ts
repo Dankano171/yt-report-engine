@@ -121,6 +121,9 @@ describe("comment analysis safety", () => {
       "a casual plan to check out or look at a product is not buying intent",
     );
     expect(prompt).toContain(
+      "Only direct information/action requests are how_to_question",
+    );
+    expect(prompt).toContain(
       "Do not treat order-status statements such as “My orders have shipped today” as a buying inquiry or purchase intent",
     );
     expect(prompt).toContain(
@@ -1224,7 +1227,7 @@ describe("report generation", () => {
       {
         ...comment,
         commentId: "low-purchase-intent",
-        text: "I might buy the course soon.",
+        text: "I plan to buy the course soon.",
       },
       {
         ...comment,
@@ -1734,6 +1737,109 @@ describe("report generation", () => {
     expect(sectionA).not.toContain("statement-1");
     expect(sectionA).not.toContain("statement-2");
     expect(report.sectionItemCounts.money).toBe(0);
+  });
+
+  it("requires a real ask or buying intent for section A and sales leads", () => {
+    const texts = [
+      "Almost worth renewing my Adobe subscription.",
+      "What a disappointing update Adobe delivered. I expected a lot better.",
+      "Wait.... They are still working?",
+      "How can I bring back the old move tool that allowed dragging a box to select multiple layers? This is frustrating.",
+      "1:05 Is it possible to remove water droplets?",
+      "Do you have the candy corn from PW?",
+    ];
+    const categories = [
+      "purchase_intent",
+      "complaint_or_objection",
+      "how_to_question",
+      "how_to_question",
+      "how_to_question",
+      "buying_or_sponsor_inquiry",
+    ] as const;
+    const entries = texts.map((text, index) => ({
+      ...comment,
+      commentId: `intent-check-${index + 1}`,
+      text,
+    }));
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: entries,
+      classifications: entries.map((entry, index) => ({
+        commentId: entry.commentId,
+        category: categories[index]!,
+        quote: entry.text,
+      })),
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const sectionA = report.markdown.slice(
+      report.markdown.indexOf("## A. No written reply"),
+      report.markdown.indexOf("## B."),
+    );
+    for (const id of ["intent-check-1", "intent-check-2", "intent-check-3"])
+      expect(sectionA).not.toContain(id);
+    for (const id of ["intent-check-4", "intent-check-5", "intent-check-6"])
+      expect(sectionA).toContain(id);
+    expect(report.markdown).toContain(
+      "- Biggest sales lead: Do you have the candy corn from PW? (1 comment)",
+    );
+    expect(report.markdown).toContain("Purchase intent: 0 (0%)");
+    expect(report.reportDestinationCounts.other).toBe(1);
+
+    const noLead = renderReport({
+      channel,
+      videos: [video],
+      comments: [entries[0]!],
+      classifications: [
+        {
+          commentId: entries[0]!.commentId,
+          category: "purchase_intent",
+          quote: entries[0]!.text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    expect(noLead.markdown).toContain("- Biggest sales lead: None identified");
+  });
+
+  it("keeps positive proof comments out of C when they also match a fix rule", () => {
+    const proofText =
+      "The link was broken at first, but fixing it helped me finish the lesson.";
+    const complaintText = "The link is broken and the tool is frustrating.";
+    const entries = [
+      { ...comment, commentId: "positive-overlap", text: proofText },
+      { ...comment, commentId: "negative-fix", text: complaintText },
+    ];
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: entries,
+      classifications: [
+        {
+          commentId: "positive-overlap",
+          category: "testimonial_or_result",
+          quote: proofText,
+        },
+        {
+          commentId: "negative-fix",
+          category: "complaint_or_objection",
+          quote: complaintText,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const sectionC = report.markdown.slice(
+      report.markdown.indexOf("## C. Fix list"),
+      report.markdown.indexOf("## D. Proof pack"),
+    );
+    const sectionD = report.markdown.slice(
+      report.markdown.indexOf("## D. Proof pack"),
+      report.markdown.indexOf("## E."),
+    );
+    expect(sectionC).not.toContain("positive-overlap");
+    expect(sectionD).toContain("positive-overlap");
+    expect(sectionC).toContain("negative-fix");
+    expect(sectionD).not.toContain("negative-fix");
   });
 
   it("includes the video title in untitled quote-only section B groups", () => {

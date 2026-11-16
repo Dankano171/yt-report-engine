@@ -68,6 +68,7 @@ export interface RenderedReport {
     purchaseIntent: number;
     praise: number;
     viewerTip: number;
+    other: number;
   };
   fullMarkdown: string;
   titleFallbacks: Partial<
@@ -232,27 +233,54 @@ function isLowConfidence(finding: Finding): boolean {
   );
 }
 
+function hasGenuineBuyingIntent(text: string): boolean {
+  const normalized = text.normalize("NFKC");
+  return (
+    /\b(?:how much|what(?:'s| is| are) (?:the )?(?:price|pricing|cost)|price (?:of|for|details)|pricing (?:details|information|info)|cost (?:of|for|details)|what does .{1,60} cost|where (?:can|do|would) (?:i|we) (?:buy|purchase|order|get)|how (?:can|do|would) (?:i|we) (?:buy|purchase|order)|can (?:i|we) (?:buy|purchase|order)|(?:buy|purchase|order) link)\b/i.test(
+      normalized,
+    ) ||
+    /\b(?:do you have|do you sell)\s+(?:(?:the|any|a|an)\s+)?(?!(?:time|minute|video|tutorial|lesson|question|idea)\b)[\p{L}\p{N}][^?!.]{0,180}(?:\bfrom\b|\bavailable\b|\bin stock\b|[?])/iu.test(
+      normalized,
+    ) ||
+    /\b(?:is|are)\s+[^?!.]{1,60}\bavailable\b|\bwhen (?:will|can) [^?!.]{1,60}\bavailable\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:i|we)(?:\s+am|['’]m|\s+are|['’]re)?\s+(?:(?:will|plan to|intend to|want to|would like to|going to|planning to)\s+(?:buy|purchase|order|subscribe to|join|enroll in|renew)|(?:buying|purchasing|ordering|subscribing to|joining|enrolling in|renewing)|(?:just|already)\s+(?:bought|purchased|ordered|subscribed to|joined|enrolled in|renewed))\b/iu.test(
+      normalized,
+    )
+  );
+}
+
+function isDirectQuestion(text: string): boolean {
+  const clauses = text
+    .normalize("NFKC")
+    .trim()
+    .replace(/^(?:(?:\d{1,2}:)?\d{1,2}:\d{2})\s*/u, "")
+    .split(/(?<=[.!?])\s+|\n+/u)
+    .map((clause) => clause.replace(/^(?:hey|hi|hello)[,.!\s]+/iu, "").trim());
+  const auxiliary =
+    "(?:is|are|was|were|do|does|did|can|could|would|will|should|has|have)";
+  const directQuestionPattern = new RegExp(
+    `^(?:how\\s+(?:${auxiliary}|to)\\b|what\\s+(?:${auxiliary}\\b|[\\p{L}\\p{N}'’-]+\\s+${auxiliary}\\b)|where\\s+${auxiliary}\\b|when\\s+${auxiliary}\\b|who\\s+${auxiliary}\\b|which\\s+${auxiliary}\\b|why\\s+${auxiliary}\\b|${auxiliary}\\s+(?:it|there|this|that|you|i|we|they|he|she|these|those|anyone|anybody|someone|somebody|(?:the|a|an|my|your|any|some|all|each|every|new|old)\\s+[\\p{L}\\p{N}'’-]+)\\b)`,
+    "iu",
+  );
+  return clauses.some((clause) => directQuestionPattern.test(clause));
+}
+
 function isActionableMoney(finding: Finding): boolean {
   const { classification, comment } = finding;
-  const asksQuestion =
-    comment.text.includes("?") ||
-    /(?:^|[.!?]\s*)(?:what|how|where|when|why|who|which)\b|\b(?:can|could|would|do|does|did|is|are|will|has|have)\s+(?:you|i|we|they|he|she|it|this|that|these|those|the|there|any|anyone|someone|somebody)\b/i.test(
-      comment.text,
-    );
-  const textAsksQuestion =
-    asksQuestion &&
-    classification.category !== "spam_or_noise" &&
-    classification.category !== "suspected_bot_or_promo" &&
-    classification.category !== "praise" &&
-    classification.category !== "testimonial_or_result" &&
-    classification.category !== "viewer_tip";
+  const buyingCategory =
+    classification.category === "purchase_intent" ||
+    classification.category === "buying_or_sponsor_inquiry";
+  const actionableQuestion =
+    classification.category === "how_to_question" &&
+    isDirectQuestion(comment.text);
   return (
     !comment.creatorReplied &&
     !isUnansweredRequest(finding) &&
     !suggestsFutureVideo(finding) &&
-    (classification.category === "purchase_intent" ||
-      classification.category === "buying_or_sponsor_inquiry" ||
-      textAsksQuestion)
+    ((buyingCategory && hasGenuineBuyingIntent(comment.text)) ||
+      actionableQuestion)
   );
 }
 
@@ -279,6 +307,7 @@ function isFix(finding: Finding): boolean {
     !isLowConfidence(finding) &&
     !comment.creatorReplied &&
     classification.category !== "viewer_tip" &&
+    classification.category !== "testimonial_or_result" &&
     !isCustomerProblem(finding) &&
     (classification.category === "confusion_or_error" ||
       classification.category === "complaint_or_objection" ||
@@ -901,9 +930,10 @@ function renderMarkdown(
     const category = isLowInformationComment(comment.text)
       ? "spam_or_noise"
       : categoriesByComment.get(comment.commentId);
+    if (category === "how_to_question") quickPulseCounts.questions += 1;
     if (
-      category === "how_to_question" ||
-      category === "buying_or_sponsor_inquiry"
+      category === "buying_or_sponsor_inquiry" &&
+      hasGenuineBuyingIntent(comment.text)
     )
       quickPulseCounts.questions += 1;
     if (category === "praise") quickPulseCounts.praise += 1;
@@ -919,7 +949,8 @@ function renderMarkdown(
     if (category === "complaint_or_objection") quickPulseCounts.objections += 1;
     if (category === "spam_or_noise") quickPulseCounts.noise += 1;
     if (category === "suspected_bot_or_promo") quickPulseCounts.botOrPromo += 1;
-    if (category === "purchase_intent") quickPulseCounts.purchaseIntent += 1;
+    if (category === "purchase_intent" && hasGenuineBuyingIntent(comment.text))
+      quickPulseCounts.purchaseIntent += 1;
   }
   const share = (count: number) =>
     `${count} (${input.comments.length ? Math.round((count / input.comments.length) * 100) : 0}%)`;
@@ -1071,6 +1102,7 @@ function renderMarkdown(
     purchaseIntent: 0,
     praise: 0,
     viewerTip: 0,
+    other: 0,
   };
   const findingById = new Map(
     findings.map((finding) => [finding.comment.commentId, finding]),
@@ -1095,7 +1127,14 @@ function renderMarkdown(
       const finding = findingById.get(classification.commentId);
       if (finding && isActionableMoney(finding))
         reportDestinationCounts.money += 1;
-      else reportDestinationCounts.purchaseIntent += 1;
+      else if (hasGenuineBuyingIntent(comment.text))
+        reportDestinationCounts.purchaseIntent += 1;
+      else reportDestinationCounts.other += 1;
+    } else if (classification.category === "buying_or_sponsor_inquiry") {
+      const finding = findingById.get(classification.commentId);
+      if (finding && isActionableMoney(finding))
+        reportDestinationCounts.money += 1;
+      else reportDestinationCounts.other += 1;
     } else if (classification.category === "viewer_tip") {
       reportDestinationCounts.viewerTip += 1;
     } else if (classification.category === "praise") {
@@ -1140,13 +1179,17 @@ function renderMarkdown(
     group
       ? `${group.title ? cleanTitle(group.title) : summaryExcerpt(group.findings[0]!.comment.text)} (${group.findings.length} comment${group.findings.length === 1 ? "" : "s"})`
       : "None identified";
-  const salesLead = otherMoneyGroups.find((group) =>
-    group.findings.some(
-      ({ classification }) =>
-        classification.category === "buying_or_sponsor_inquiry" ||
-        classification.category === "purchase_intent",
-    ),
-  );
+  const isSalesLead = ({ classification, comment }: Finding) =>
+    hasGenuineBuyingIntent(comment.text) &&
+    (classification.category === "buying_or_sponsor_inquiry" ||
+      classification.category === "purchase_intent");
+  const salesLead =
+    otherMoneyGroups.find((group) => group.findings.some(isSalesLead)) ??
+    otherMoneyGroups.find((group) =>
+      group.findings.some(({ comment }) =>
+        hasGenuineBuyingIntent(comment.text),
+      ),
+    );
   const biggestObjection = [...fixes]
     .filter((group) =>
       group.findings.some(

@@ -83,6 +83,7 @@ export interface RunStats {
     purchaseIntent: number;
     praise: number;
     viewerTip: number;
+    other: number;
   };
   titleFallbacks: Partial<
     Record<ReportSection, { count: number; reason: string }>
@@ -267,6 +268,7 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
         purchaseIntent: 0,
         praise: 0,
         viewerTip: 0,
+        other: 0,
       },
       titleFallbacks: {},
       clustering: {
