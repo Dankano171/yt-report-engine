@@ -25,7 +25,11 @@ const config: AppConfig = {
   channels: [channel],
 };
 
-function fetcher(commentCount = 1, texts?: string[]): Fetcher {
+function fetcher(
+  commentCount = 1,
+  texts?: string[],
+  videoDescription = "",
+): Fetcher {
   return async (input) => {
     const endpoint = new URL(String(input)).pathname.split("/").at(-1);
     const data: Record<string, unknown> = {
@@ -53,7 +57,7 @@ function fetcher(commentCount = 1, texts?: string[]): Fetcher {
             id: "video1",
             snippet: {
               title: "Tutorial",
-              description: "",
+              description: videoDescription,
               publishedAt: "2026-03-10T12:00:00Z",
             },
             statistics: { viewCount: "10", commentCount: "1" },
@@ -203,7 +207,7 @@ describe("run pipeline", () => {
       commentsFetched: 1,
       commentsSentToLlm: 0,
       classificationsByCategory: { how_to_question: 1 },
-      reportItemsBySection: { money: 0 },
+      reportItemsBySection: { money: 1 },
       droppedQuotes: {
         emptyQuote: 0,
         quoteNotFound: 0,
@@ -342,7 +346,7 @@ describe("run pipeline", () => {
     ).toBe(result.stats.commentsClassified);
   });
 
-  it("classifies repeated short phrases as keyword responses without an LLM call", async () => {
+  it("classifies repeated short phrases normally when no keyword was requested", async () => {
     root = await mkdtemp(join(tmpdir(), "yt-report-keyword-response-"));
     process.env.YOUTUBE_API_KEY = "test-youtube-secret";
     let llmCalls = 0;
@@ -388,20 +392,107 @@ describe("run pipeline", () => {
     });
     expect(llmCalls).toBe(0);
     expect(result.stats.commentsClassified).toBe(5);
-    expect(result.stats.classificationsByCategory.keyword_response).toBe(5);
+    expect(result.stats.classificationsByCategory.keyword_response).toBe(0);
+    expect(result.stats.classificationsByCategory.praise).toBe(5);
     const markdown = await readFile(
       join(result.reportFolder, "report.md"),
       "utf8",
     );
-    expect(markdown).toContain(
-      "5 viewers commented a 'full course' variant; the creator replied to 0",
+    const html = await readFile(
+      join(result.reportFolder, "report.html"),
+      "utf8",
     );
-    expect(markdown).toContain("— 5 comments");
-    expect(markdown).toContain("comment1");
-    expect(markdown).toContain("comment2");
-    expect(markdown).toContain("comment3");
-    expect(markdown).not.toContain("comment4");
-    expect(markdown).not.toContain("comment5");
+    expect(markdown).not.toContain("keyword");
+    expect(html).not.toContain("keyword");
+    expect(markdown).not.toContain("Viewer comment about");
+    expect(html).not.toContain("Viewer comment about");
+  });
+
+  it("groups explicitly requested keywords and leaves similar comments alone", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-keyword-request-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-secret";
+    const texts = [
+      "GARDEN",
+      "GARDEN",
+      "GARDEN",
+      "GARDEN",
+      "GARDEN",
+      "Congratulations!",
+    ];
+    const result = await runChannel({
+      channel,
+      config,
+      days: 30,
+      send: false,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: fetcher(
+        texts.length,
+        texts,
+        "Comment the word GARDEN to get the guide.",
+      ),
+      wait: async () => {},
+    });
+    expect(result.stats.classificationsByCategory.keyword_response).toBe(5);
+    expect(result.stats.classificationsByCategory.praise).toBe(1);
+    const markdown = await readFile(
+      join(result.reportFolder, "report.md"),
+      "utf8",
+    );
+    const html = await readFile(
+      join(result.reportFolder, "report.html"),
+      "utf8",
+    );
+    expect(markdown).toContain(
+      "Viewers who commented the keyword and got no reply",
+    );
+    expect(markdown.match(/commented a 'garden' variant/g)).toHaveLength(1);
+    expect(markdown).not.toContain("Congratulations!");
+    expect(html).toContain(
+      "Viewers who commented the keyword and got no reply",
+    );
+    expect(html).not.toContain("Congratulations!");
+  });
+
+  it("does not mistake congratulations comments for keyword leads", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-congratulations-"));
+    process.env.YOUTUBE_API_KEY = "test-youtube-secret";
+    const texts = [
+      "Congratulations!",
+      "Congratulations to her!",
+      "Congrats!",
+      "Congratulations!",
+      "Congrats!",
+      "Congratulations to her!",
+    ];
+    const result = await runChannel({
+      channel,
+      config,
+      days: 30,
+      send: false,
+      outputRoot: join(root, "output"),
+      cacheRoot: join(root, "cache"),
+      usagePath: join(root, "usage", "usage.jsonl"),
+      now: new Date("2026-03-15T00:00:00Z"),
+      fetcher: fetcher(texts.length, texts, ""),
+      wait: async () => {},
+    });
+    expect(result.stats.classificationsByCategory.keyword_response).toBe(0);
+    expect(result.stats.classificationsByCategory.praise).toBe(6);
+    expect(result.stats.reportItemsBySection.money).toBe(0);
+    const markdown = await readFile(
+      join(result.reportFolder, "report.md"),
+      "utf8",
+    );
+    const html = await readFile(
+      join(result.reportFolder, "report.html"),
+      "utf8",
+    );
+    expect(markdown).not.toContain("keyword");
+    expect(html).not.toContain("keyword");
+    expect(markdown).not.toContain("commented a");
   });
 
   it("records three eight-or-fewer clustering calls for 19 report comments", async () => {
@@ -488,7 +579,7 @@ describe("run pipeline", () => {
     });
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Writing cluster call: section=ideas, comments=8",
+        "Writing cluster call: section=money, comments=8",
       ),
     );
     const markdown = await readFile(

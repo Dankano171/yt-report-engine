@@ -294,7 +294,10 @@ export async function runChannel(options: RunOptions): Promise<RunResult> {
   const nonEmptyComments = viewerComments.filter((comment) =>
     comment.text.trim(),
   );
-  const keywordResponses = detectKeywordResponses(nonEmptyComments);
+  const keywordResponses = detectKeywordResponses(
+    nonEmptyComments,
+    data.videos,
+  );
   const selectedComments = options.classifyOnly
     ? nonEmptyComments.slice(0, 20)
     : nonEmptyComments;

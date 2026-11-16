@@ -30,6 +30,9 @@ const categories = [
   "mentoring_or_personal_request",
   "keyword_response",
 ] as const satisfies readonly Category[];
+const modelCategories = categories.filter(
+  (category) => category !== "keyword_response",
+);
 
 const geminiSystemInstruction =
   "Classify each supplied comment according to the user's classification instructions. Return only the requested JSON.";
@@ -205,8 +208,8 @@ export function buildClassificationPrompt(comments: CommentRecord[]): string {
     creatorReplied: comment.creatorReplied,
   }));
   return [
-    `Classify every comment using exactly one category string from this list: ${categories.join(", ")}.`,
-    "Category examples (all examples are invented): buying_or_sponsor_inquiry — “What does it cost?”; “Can my team buy access?”; how_to_question — “How do I export a table?”; “Where is the setup menu?”; confusion_or_error — “I do not understand why the sample link opens blank.”; “I do not understand this settings step.”; complaint_or_objection — “This plan is too expensive.”; “That step seems risky.”; viewer_tip — “I use a cotton curtain to strain the syrup.”; “In my garden, the ants eat the leaves but the yams return.”; testimonial_or_result — “I saved two hours using this lesson.”; “Your tutorial helped me finish my first project.”; topic_request — “Please cover monthly budgeting.”; “Show an interview setup.”; language_or_subtitles_request — “Add French captions.”; “Could you translate this lesson?”; alternative_or_tool_request — “Compare this with Tool A.”; “Can you show another editing app?”; format_request — “Make a shorter version.”; “Add a printable checklist.”; praise — “This was very clear.”; “That lumpy vegetable looks like a tiny dragon — your garden photos always make me smile.”; “Nice pun, I laughed.”; spam_or_noise — “🔥🔥”; “ok”; “im tired boss” (unless it mentions the video, creator, or product); a playful “That potato looks like a celebrity” is praise or noise, never a concern or fix; suspected_bot_or_promo — “Get rich fast with my unrelated investment course, visit my profile for a free consultation.”; “Our revolutionary global platform empowers every creator to unlock limitless success, message us today.”; purchase_intent — “I’m joining the course this week.”; “Just bought the annual plan.”; mentoring_or_personal_request — “Could you mentor me as I learn trading?”; “Can I get personal guidance with my first project?”; keyword_response — “full course”; “template please”.",
+    `Classify every comment using exactly one category string from this list: ${modelCategories.join(", ")}.`,
+    "Category examples (all examples are invented): buying_or_sponsor_inquiry — “What does it cost?”; “Can my team buy access?”; how_to_question — “How do I export a table?”; “Where is the setup menu?”; confusion_or_error — “I do not understand why the sample link opens blank.”; “I do not understand this settings step.”; complaint_or_objection — “This plan is too expensive.”; “That step seems risky.”; viewer_tip — “I use a cotton curtain to strain the syrup.”; “In my garden, the ants eat the leaves but the yams return.”; testimonial_or_result — “I saved two hours using this lesson.”; “Your tutorial helped me finish my first project.”; topic_request — “Please cover monthly budgeting.”; “Show an interview setup.”; language_or_subtitles_request — “Add French captions.”; “Could you translate this lesson?”; alternative_or_tool_request — “Compare this with Tool A.”; “Can you show another editing app?”; format_request — “Make a shorter version.”; “Add a printable checklist.”; praise — “This was very clear.”; “That lumpy vegetable looks like a tiny dragon — your garden photos always make me smile.”; “Nice pun, I laughed.”; spam_or_noise — “🔥🔥”; “ok”; “im tired boss” (unless it mentions the video, creator, or product); a playful “That potato looks like a celebrity” is praise or noise, never a concern or fix; suspected_bot_or_promo — “Get rich fast with my unrelated investment course, visit my profile for a free consultation.”; “Our revolutionary global platform empowers every creator to unlock limitless success, message us today.”; purchase_intent — “I’m joining the course this week.”; “Just bought the annual plan.”; mentoring_or_personal_request — “Could you mentor me as I learn trading?”; “Can I get personal guidance with my first project?”.",
     "Questions, requests, objections, and testimonials must not be labelled spam_or_noise. Only emoji-only, one-word, or content-free comments are noise.",
     "Classify jokes, puns, playful remarks, and sarcasm as praise or spam_or_noise, never as confusion_or_error or complaint_or_objection, unless the viewer explicitly describes a real problem. Advice, recipes, and personal experiences shared without asking for something are viewer_tip, not a request or confusion. Use confusion_or_error only when the viewer explicitly says they do not understand; an explanation or tip is viewer_tip. A viewer_tip belongs in Viewer suggestions only when it clearly suggests a topic for a future video.",
     "Context-free expressions such as “im tired boss” are spam_or_noise unless the comment specifically mentions the video, creator, or product.",
@@ -229,6 +232,7 @@ function normalizeCategory(value: string): string {
 
 function mapCategory(value: string): Category | undefined {
   const normalized = normalizeCategory(value);
+  if (normalized === "keyword_response") return "praise";
   return (
     categories.find((category) => category === normalized) ??
     categoryAliases[normalized]
@@ -1132,7 +1136,7 @@ export async function analyzeComments(
           const chunkPrompt = buildClassificationPrompt(pendingComments);
           const strictReminder =
             attempt === 2
-              ? `\nSTRICT FORMAT REMINDER: Return exactly one item for each expected integer id and no other ids. Expected ids: ${JSON.stringify(expectedIds)}.${retryForUnmapped ? ` Use exactly one category from this allowed list: ${categories.join(", ")}.` : ""}`
+              ? `\nSTRICT FORMAT REMINDER: Return exactly one item for each expected integer id and no other ids. Expected ids: ${JSON.stringify(expectedIds)}.${retryForUnmapped ? ` Use exactly one category from this allowed list: ${modelCategories.join(", ")}.` : ""}`
               : "";
           const chunkOutputLimit =
             options.modelOptions?.[options.model!]?.maxOutputTokens ??

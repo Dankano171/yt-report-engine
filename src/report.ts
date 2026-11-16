@@ -7,6 +7,7 @@ import type {
   VideoRecord,
 } from "./types.js";
 import {
+  detectKeywordResponses,
   isLowInformationComment,
   keywordResponseGroupKey,
   normalizeKeywordResponse,
@@ -214,61 +215,7 @@ interface FindingGroup {
   fallbackReason?: string;
 }
 
-const titleStopWords = new Set([
-  "about",
-  "after",
-  "again",
-  "also",
-  "because",
-  "been",
-  "being",
-  "could",
-  "from",
-  "have",
-  "help",
-  "here",
-  "into",
-  "just",
-  "like",
-  "more",
-  "please",
-  "should",
-  "that",
-  "them",
-  "then",
-  "there",
-  "they",
-  "this",
-  "what",
-  "when",
-  "where",
-  "which",
-  "with",
-  "would",
-  "your",
-]);
-
-function neutralCommentTitle(text: string): string {
-  const words = text.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [];
-  const counts = new Map<string, number>();
-  for (const word of words) {
-    if (!titleStopWords.has(word))
-      counts.set(word, (counts.get(word) ?? 0) + 1);
-  }
-  const keyWords = [...counts]
-    .sort(
-      ([left, leftCount], [right, rightCount]) =>
-        rightCount - leftCount || left.localeCompare(right),
-    )
-    .slice(0, 5)
-    .map(([word]) => word);
-  return keyWords.length
-    ? `Viewer comment about ${keyWords.join(" ")}`
-    : "General viewer feedback";
-}
-
 const requestCategories = new Set<Category>([
-  "how_to_question",
   "topic_request",
   "language_or_subtitles_request",
   "alternative_or_tool_request",
@@ -287,22 +234,27 @@ function isLowConfidence(finding: Finding): boolean {
 
 function isActionableMoney(finding: Finding): boolean {
   const { classification, comment } = finding;
-  const topicNeedsCreatorAction =
-    /\b(buy|purchase|access|price|pricing|cost|payment|paid|sponsor|partnership|refund|membership|password|login|account)\b/i.test(
-      comment.text,
-    );
   const asksQuestion =
-    /[?]|\b(what|how|where|when|can|could|does|do|is|are|which|who)\b/i.test(
+    comment.text.includes("?") ||
+    /^\s*(?:what|how|where|when|why|who|which|can|could|would|do|does|is|are|will|did|has|have)\b/i.test(
       comment.text,
     );
+  const textAsksQuestion =
+    asksQuestion &&
+    classification.category !== "spam_or_noise" &&
+    classification.category !== "suspected_bot_or_promo" &&
+    classification.category !== "praise" &&
+    classification.category !== "testimonial_or_result" &&
+    classification.category !== "viewer_tip";
   return (
-    !isLowConfidence(finding) &&
     !comment.creatorReplied &&
-    classification.category !== "viewer_tip" &&
-    classification.category !== "mentoring_or_personal_request" &&
-    (isCustomerProblem(finding) ||
-      (classification.category === "buying_or_sponsor_inquiry" &&
-        (topicNeedsCreatorAction || asksQuestion)))
+    !isUnansweredRequest(finding) &&
+    !suggestsFutureVideo(finding) &&
+    (classification.category === "purchase_intent" ||
+      classification.category === "how_to_question" ||
+      classification.category === "buying_or_sponsor_inquiry" ||
+      textAsksQuestion ||
+      (!isLowConfidence(finding) && isCustomerProblem(finding)))
   );
 }
 
@@ -365,6 +317,12 @@ function isUnansweredRequest(finding: Finding): boolean {
     !finding.comment.creatorReplied &&
     requestCategories.has(finding.classification.category)
   );
+}
+
+function validGroupTitle(title: string | undefined): string | undefined {
+  const trimmed = title?.trim();
+  if (!trimmed || /^Viewer comment about/i.test(trimmed)) return undefined;
+  return trimmed;
 }
 
 export async function clusterReportSections(
@@ -478,6 +436,7 @@ function groupsForSection(
       .filter((finding): finding is Finding => finding !== undefined);
     if (members.length === 0) continue;
     members.forEach((finding) => assigned.add(finding.comment.commentId));
+    const title = validGroupTitle(cluster.title);
     result.push({
       findings: members,
       viewers: new Set(
@@ -486,7 +445,9 @@ function groupsForSection(
             finding.comment.authorChannelId ?? finding.comment.commentId,
         ),
       ).size,
-      title: cluster.title,
+      ...(title
+        ? { title }
+        : { fallbackReason: "invalid writing-model title" }),
       ...(cluster.paraphrase ? { paraphrase: cluster.paraphrase } : {}),
     });
   }
@@ -495,7 +456,6 @@ function groupsForSection(
     result.push({
       findings: [finding],
       viewers: 1,
-      title: neutralCommentTitle(finding.comment.text),
       fallbackReason:
         sectionData?.fallbackReason ?? "no validated writing-model title",
     });
@@ -507,6 +467,9 @@ function findingList(input: ReportInput): {
   findings: Finding[];
   droppedQuotes: RenderedReport["droppedQuotes"];
 } {
+  const detectedKeywordResponses = new Set(
+    detectKeywordResponses(input.comments, input.videos).keys(),
+  );
   const comments = new Map(
     input.comments.map((comment) => [comment.commentId, comment]),
   );
@@ -527,10 +490,13 @@ function findingList(input: ReportInput): {
       );
       continue;
     }
+    if (classification.category === "suspected_bot_or_promo") continue;
     if (
-      classification.category === "suspected_bot_or_promo" ||
-      classification.category === "purchase_intent"
+      classification.category === "keyword_response" &&
+      !detectedKeywordResponses.has(classification.commentId)
     )
+      continue;
+    if (classification.category === "purchase_intent" && comment.creatorReplied)
       continue;
     if (isLowInformationComment(comment.text)) continue;
     const video = videos.get(comment.videoId);
@@ -594,6 +560,35 @@ function cleanTitle(title: string): string {
     .split(" ")
     .slice(0, 8)
     .join(" ");
+}
+
+function quoteOnlyGroup(group: FindingGroup): string {
+  return group.findings
+    .map((finding) => {
+      const replyLink = finding.comment.creatorReplyId
+        ? buildDeepLink(
+            finding.comment.videoId,
+            finding.comment.commentId,
+            finding.comment.creatorReplyId,
+          )
+        : undefined;
+      return [
+        quoteBlock(finding.classification.quote),
+        `[Open comment](${finding.link})`,
+        replyLink ? `[Open creator reply](${replyLink})` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    })
+    .join("\n\n");
+}
+
+function summaryExcerpt(text: string, maximum = 80): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maximum) return trimmed;
+  const clipped = trimmed.slice(0, maximum - 3);
+  const wordEnd = clipped.lastIndexOf(" ");
+  return `${(wordEnd > 0 ? clipped.slice(0, wordEnd) : clipped).trimEnd()}...`;
 }
 
 function paraphrase(group: FindingGroup): string {
@@ -933,6 +928,7 @@ function renderMarkdown(
   const viewerLabel = (viewers: number) =>
     `${viewers} viewer${viewers === 1 ? "" : "s"}`;
   const requestItems = requests.map((group) => {
+    if (!group.title) return quoteOnlyGroup(group);
     const title = cleanTitle(group.title ?? "Viewer feedback");
     const countLabel = `${viewerLabel(group.viewers)}${group.viewers === 1 ? " (single mention)" : ""}`;
     const examples = group.findings.slice(0, 3);
@@ -949,6 +945,7 @@ function renderMarkdown(
       .join("\n\n")}${more}`;
   });
   const viewerSuggestionItems = viewerSuggestions.map((group) => {
+    if (!group.title) return quoteOnlyGroup(group);
     const title = cleanTitle(group.title ?? "Viewer suggestion");
     const countLabel = `${viewerLabel(group.viewers)}${group.viewers === 1 ? " (single mention)" : ""}`;
     const examples = group.findings.slice(0, 3);
@@ -964,6 +961,7 @@ function renderMarkdown(
       .join("\n\n")}${more}`;
   });
   const fixItems = fixes.map((group) => {
+    if (!group.title) return quoteOnlyGroup(group);
     const title = cleanTitle(group.title ?? "Viewer feedback");
     const countLabel = `${viewerLabel(group.viewers)}${group.viewers === 1 ? " (single mention)" : ""}`;
     const examples = group.findings.slice(0, 3);
@@ -986,6 +984,7 @@ function renderMarkdown(
       .join("\n\n")}${more}`;
   });
   const answeredItems = answeredQuestions.map((group) => {
+    if (!group.title) return quoteOnlyGroup(group);
     const countLabel = viewerLabel(group.viewers);
     const examples = group.findings.slice(0, 3);
     const more =
@@ -1033,6 +1032,7 @@ function renderMarkdown(
       : undefined;
   const moneyItems = [
     ...moneyGroups.map((group) => {
+      if (!group.title) return quoteOnlyGroup(group);
       const title = cleanTitle(group.title ?? "Viewer feedback");
       const examples = group.findings.slice(0, 3);
       const more =
@@ -1090,9 +1090,14 @@ function renderMarkdown(
     ) {
       reportDestinationCounts.noise += 1;
     } else if (classification.category === "keyword_response") {
-      reportDestinationCounts.keywordGroup += 1;
+      if (findingById.has(classification.commentId))
+        reportDestinationCounts.keywordGroup += 1;
+      else reportDestinationCounts.praise += 1;
     } else if (classification.category === "purchase_intent") {
-      reportDestinationCounts.purchaseIntent += 1;
+      const finding = findingById.get(classification.commentId);
+      if (finding && isActionableMoney(finding))
+        reportDestinationCounts.money += 1;
+      else reportDestinationCounts.purchaseIntent += 1;
     } else if (classification.category === "viewer_tip") {
       reportDestinationCounts.viewerTip += 1;
     } else if (classification.category === "praise") {
@@ -1135,9 +1140,15 @@ function renderMarkdown(
   const enough = input.videos.length > 0 || input.comments.length > 0;
   const summaryValue = (group: FindingGroup | undefined) =>
     group
-      ? `${cleanTitle(group.title ?? "Viewer feedback")} (${group.findings.length} comment${group.findings.length === 1 ? "" : "s"})`
+      ? `${group.title ? cleanTitle(group.title) : summaryExcerpt(group.findings[0]!.comment.text)} (${group.findings.length} comment${group.findings.length === 1 ? "" : "s"})`
       : "None identified";
-  const salesLead = otherMoneyGroups[0];
+  const salesLead = otherMoneyGroups.find((group) =>
+    group.findings.some(
+      ({ classification }) =>
+        classification.category === "buying_or_sponsor_inquiry" ||
+        classification.category === "purchase_intent",
+    ),
+  );
   const biggestObjection = [...fixes]
     .filter((group) =>
       group.findings.some(
@@ -1232,17 +1243,17 @@ function renderMarkdown(
       "",
       "## A. No written reply",
       moneyItems.length
-        ? sectionList(moneyItems, full)
+        ? sectionList(moneyItems, true)
         : input.classificationSucceeded === false
           ? incompleteMessage
-          : "_No unanswered purchase/sponsor inquiry, high-like question, or keyword response found in the analyzed comments._",
+          : "_No unanswered questions or purchase-intent comments found in the analyzed comments._",
       "",
       "## B. Requests and ideas",
       requestItems.length || viewerSuggestionItems.length
         ? ideasSection(full)
         : input.classificationSucceeded === false
           ? incompleteMessage
-          : "_No questions or viewer requests found._",
+          : "_No future requests or ideas found._",
       "",
       "## C. Fix list",
       fixItems.length

@@ -25,6 +25,25 @@ export function keywordResponseGroupKey(text: string): string {
   return `${words[0]} ${words[1]![0]}`;
 }
 
+function requestedKeyword(description: string): string | undefined {
+  const patterns = [
+    /\b(?:comment|type)\s+(?:the\s+)?(?:word|phrase)\s+["“']?([^"'“”.,!?;]{1,40}?)["”']?(?=\s+(?:below|in the comments|to get|to receive|for|and|if)\b|[,.;!?]|$)/iu,
+    /\bcomment\s+["“']?([\p{L}\p{N}_-]{2,40})["”']?\s+(?:below|in the comments)\b/iu,
+    /\btype\s+["“']?([\p{L}\p{N}_-]{2,40})["”']?(?=\s+(?:below|in the comments|to get|to receive|for)\b|[,.;!?]|$)/iu,
+  ];
+  for (const pattern of patterns) {
+    const match = description.match(pattern);
+    const keyword = match?.[1]?.trim();
+    if (keyword) return normalizeKeywordResponse(keyword);
+  }
+  return undefined;
+}
+
+function containsKeyword(text: string, keyword: string): boolean {
+  const normalized = normalizeKeywordResponse(text);
+  return ` ${normalized} `.includes(` ${keyword} `);
+}
+
 export function truncateQuote(text: string, maximum = 500): string {
   const trimmed = text.trim();
   if (trimmed.length <= maximum) return trimmed;
@@ -54,36 +73,22 @@ export function truncateQuote(text: string, maximum = 500): string {
 
 export function detectKeywordResponses(
   comments: { commentId: string; videoId: string; text: string }[],
+  videos: { videoId: string; description: string }[],
 ): Map<string, string> {
-  const grouped = new Map<string, { id: string; phrase: string }[]>();
-  for (const comment of comments) {
-    if (
-      /^\s*(?:how|what|where|when|why|who|which|can|could|would|do|does|is|are)\b/i.test(
-        comment.text,
-      )
-    )
-      continue;
-    const phrase = normalizeKeywordResponse(comment.text);
-    if (!phrase || phrase.split(" ").length >= 6) continue;
-    const key = `${comment.videoId}\u0000${keywordResponseGroupKey(phrase)}`;
-    const entries = grouped.get(key) ?? [];
-    entries.push({ id: comment.commentId, phrase });
-    grouped.set(key, entries);
-  }
   const result = new Map<string, string>();
-  for (const entries of grouped.values()) {
+  const videoById = new Map(videos.map((video) => [video.videoId, video]));
+  const grouped = new Map<string, typeof comments>();
+  for (const comment of comments) {
+    const video = videoById.get(comment.videoId);
+    const keyword = video ? requestedKeyword(video.description) : undefined;
+    if (!keyword || !containsKeyword(comment.text, keyword)) continue;
+    const key = `${comment.videoId}\u0000${keyword}`;
+    grouped.set(key, [...(grouped.get(key) ?? []), comment]);
+  }
+  for (const [key, entries] of grouped) {
     if (entries.length < 5) continue;
-    const counts = new Map<string, number>();
-    for (const entry of entries)
-      counts.set(entry.phrase, (counts.get(entry.phrase) ?? 0) + 1);
-    const canonical = [...counts].sort(
-      ([left, leftCount], [right, rightCount]) =>
-        rightCount - leftCount || right.length - left.length,
-    )[0]?.[0];
-    if (!canonical) continue;
-    for (const { id } of entries) {
-      result.set(id, canonical);
-    }
+    const keyword = key.slice(key.indexOf("\u0000") + 1);
+    for (const { commentId } of entries) result.set(commentId, keyword);
   }
   return result;
 }
