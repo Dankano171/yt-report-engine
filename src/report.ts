@@ -236,7 +236,7 @@ function isActionableMoney(finding: Finding): boolean {
   const { classification, comment } = finding;
   const asksQuestion =
     comment.text.includes("?") ||
-    /^\s*(?:what|how|where|when|why|who|which|can|could|would|do|does|is|are|will|did|has|have)\b/i.test(
+    /(?:^|[.!?]\s*)(?:what|how|where|when|why|who|which)\b|\b(?:can|could|would|do|does|did|is|are|will|has|have)\s+(?:you|i|we|they|he|she|it|this|that|these|those|the|there|any|anyone|someone|somebody)\b/i.test(
       comment.text,
     );
   const textAsksQuestion =
@@ -251,10 +251,8 @@ function isActionableMoney(finding: Finding): boolean {
     !isUnansweredRequest(finding) &&
     !suggestsFutureVideo(finding) &&
     (classification.category === "purchase_intent" ||
-      classification.category === "how_to_question" ||
       classification.category === "buying_or_sponsor_inquiry" ||
-      textAsksQuestion ||
-      (!isLowConfidence(finding) && isCustomerProblem(finding)))
+      textAsksQuestion)
   );
 }
 
@@ -574,7 +572,7 @@ function quoteOnlyGroup(group: FindingGroup): string {
         : undefined;
       return [
         quoteBlock(finding.classification.quote),
-        `[Open comment](${finding.link})`,
+        `[Open comment](${finding.link}) on **${escapeMarkdown(finding.video.title)}**`,
         replyLink ? `[Open creator reply](${replyLink})` : "",
       ]
         .filter(Boolean)

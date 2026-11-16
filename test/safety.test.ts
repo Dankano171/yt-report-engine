@@ -118,6 +118,12 @@ describe("comment analysis safety", () => {
       "Questions, requests, objections, and testimonials must not be labelled spam_or_noise",
     );
     expect(prompt).toContain(
+      "a casual plan to check out or look at a product is not buying intent",
+    );
+    expect(prompt).toContain(
+      "Do not treat order-status statements such as “My orders have shipped today” as a buying inquiry or purchase intent",
+    );
+    expect(prompt).toContain(
       "Only emoji-only, one-word, or content-free comments are noise",
     );
     expect(prompt).toContain("What does it cost?");
@@ -1439,18 +1445,18 @@ describe("report generation", () => {
     const report = renderReport({
       channel,
       videos: [video],
-      comments: [{ ...comment, text: "A cafe\u0301 & tea" }],
+      comments: [{ ...comment, text: "What is in this cafe\u0301 & tea?" }],
       classifications: [
         {
           commentId: "c1",
           category: "how_to_question",
-          quote: "A&nbsp;café&nbsp;&amp;&nbsp;tea",
+          quote: "What is in this cafe\u0301 & tea?",
         },
       ],
       dateRange: { from: "2026-02-13", to: "2026-03-15" },
     });
     expect(report.verifiedClassifications).toHaveLength(1);
-    expect(report.markdown).toContain("A cafe\u0301 & tea");
+    expect(report.markdown).toContain("What is in this cafe\u0301 & tea?");
     expect(report.markdown).not.toContain("A&nbsp;café&nbsp;&amp;&nbsp;tea");
     expect(report.droppedQuotes.quoteNotFound).toBe(0);
   });
@@ -1698,6 +1704,64 @@ describe("report generation", () => {
       count: 4,
       reason: "no validated writing-model title",
     });
+  });
+
+  it("keeps statements without a question or buying intent out of section A", () => {
+    const texts = [
+      "My orders have shipped today",
+      "Looking good Jenny! I will be checking out the candles.",
+    ];
+    const entries = texts.map((text, index) => ({
+      ...comment,
+      commentId: `statement-${index + 1}`,
+      text,
+    }));
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: entries,
+      classifications: entries.map((entry) => ({
+        commentId: entry.commentId,
+        category: "how_to_question" as const,
+        quote: entry.text,
+      })),
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const sectionA = report.markdown.slice(
+      report.markdown.indexOf("## A."),
+      report.markdown.indexOf("## B."),
+    );
+    expect(sectionA).not.toContain("statement-1");
+    expect(sectionA).not.toContain("statement-2");
+    expect(report.sectionItemCounts.money).toBe(0);
+  });
+
+  it("includes the video title in untitled quote-only section B groups", () => {
+    const request = {
+      ...comment,
+      commentId: "untitled-request",
+      text: "Could you make a video about planting tomatoes?",
+    };
+    const report = renderReport({
+      channel,
+      videos: [video],
+      comments: [request],
+      classifications: [
+        {
+          commentId: request.commentId,
+          category: "topic_request",
+          quote: request.text,
+        },
+      ],
+      dateRange: { from: "2026-02-13", to: "2026-03-15" },
+    });
+    const sectionB = report.markdown.slice(
+      report.markdown.indexOf("## B."),
+      report.markdown.indexOf("## C."),
+    );
+    expect(sectionB).toContain(
+      "[Open comment](https://www.youtube.com/watch?v=v1&lc=untitled-request) on **A video**",
+    );
   });
 
   it("renders validated cluster titles without markdown escapes or copied comment openings", () => {
