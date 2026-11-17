@@ -15,9 +15,48 @@ const channelSchema = z
     ]),
     recipients: z.array(z.string().email()).min(1),
     productKeywords: z.array(z.string()).default([]),
+    enabled: z.boolean().optional(),
+    offerDescription: z.string().optional(),
+    purchaseLink: z.string().url().optional(),
+    runTime: z
+      .string()
+      .regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "runTime must be HH:MM")
+      .optional(),
+    timezone: z
+      .string()
+      .min(1)
+      .refine(
+        (value) => {
+          try {
+            new Intl.DateTimeFormat("en-US", { timeZone: value });
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        { message: "timezone must be a valid IANA timezone" },
+      )
+      .optional(),
   })
   .refine((value) => Boolean(value.handle) !== Boolean(value.channelId), {
     message: "Each channel must set exactly one of handle or channelId",
+  })
+  .superRefine((value, context) => {
+    if (value.enabled !== true || !value.offerDescription?.trim()) return;
+    if (!value.runTime) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "runTime is required for an enabled alert channel",
+        path: ["runTime"],
+      });
+    }
+    if (!value.timezone) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "timezone is required for an enabled alert channel",
+        path: ["timezone"],
+      });
+    }
   });
 
 const configSchema = z
@@ -109,6 +148,13 @@ export async function loadConfig(path = "config.json"): Promise<AppConfig> {
       creatorGoal: channel.creatorGoal,
       recipients: channel.recipients,
       productKeywords: channel.productKeywords,
+      ...(channel.enabled !== undefined ? { enabled: channel.enabled } : {}),
+      ...(channel.offerDescription !== undefined
+        ? { offerDescription: channel.offerDescription }
+        : {}),
+      ...(channel.purchaseLink ? { purchaseLink: channel.purchaseLink } : {}),
+      ...(channel.runTime ? { runTime: channel.runTime } : {}),
+      ...(channel.timezone ? { timezone: channel.timezone } : {}),
     })),
   };
 }

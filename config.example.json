@@ -21,7 +21,12 @@
       "creatorName": "Example Creator",
       "creatorGoal": "grow_audience",
       "recipients": ["you@example.com"],
-      "productKeywords": ["Example product"]
+      "productKeywords": ["Example product"],
+      "enabled": false,
+      "offerDescription": "Describe the course, coaching, or service viewers can buy.",
+      "purchaseLink": "https://example.com/offer",
+      "runTime": "09:00",
+      "timezone": "America/New_York"
     }
   ]
 }

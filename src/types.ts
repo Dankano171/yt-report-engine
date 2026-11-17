@@ -26,6 +26,11 @@ export interface ChannelConfig {
   creatorGoal: CreatorGoal;
   recipients: string[];
   productKeywords: string[];
+  enabled?: boolean;
+  offerDescription?: string;
+  purchaseLink?: string;
+  runTime?: string;
+  timezone?: string;
 }
 
 export interface GeminiModelOptions {

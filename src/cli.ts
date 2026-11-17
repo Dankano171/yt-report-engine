@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { runAlertsCheck } from "./alerts.js";
 import { loadConfig, matchChannel } from "./config.js";
 import { sendExistingReport } from "./email.js";
 import { QuotaError, redactSecrets } from "./errors.js";
@@ -80,6 +81,24 @@ program
       );
     },
   );
+
+program
+  .command("alerts-check")
+  .description("Check buyer comments without sending email or writing state")
+  .requiredOption(
+    "--channel <handle>",
+    "Configured YouTube channel handle or channel ID",
+  )
+  .requiredOption("--dry-run", "Print qualifying buyer comments as JSON only")
+  .action(async (options: { channel: string; dryRun: boolean }) => {
+    if (!options.dryRun) throw new Error("alerts-check requires --dry-run.");
+    const config = await loadConfig();
+    const channel = matchChannel(config.channels, options.channel);
+    const result = await runAlertsCheck({ channel, config });
+    console.log(
+      JSON.stringify(result.skipped ? result : result.comments, null, 2),
+    );
+  });
 
 program
   .command("send")
