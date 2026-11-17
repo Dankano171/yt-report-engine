@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { runAlertsCheck } from "./alerts.js";
+import { confirmAlertDraftSent, createAlertDraft } from "./alert-drafts.js";
 import {
   AlertStateStore,
   DEFAULT_ALERT_DB_PATH,
@@ -8,9 +9,7 @@ import {
   readAlertStateIfExists,
 } from "./alert-state.js";
 import { loadConfig, matchChannel } from "./config.js";
-import { sendExistingReport } from "./email.js";
 import { QuotaError, redactSecrets } from "./errors.js";
-import { runChannel } from "./pipeline.js";
 import { purgeOldCache, purgeOldDebugDumps, readUsage } from "./storage.js";
 
 const program = new Command();
@@ -58,6 +57,7 @@ program
         throw new Error("--classify-only cannot be combined with --send.");
       const config = await loadConfig();
       const channel = matchChannel(config.channels, options.channel);
+      const { runChannel } = await import("./pipeline.js");
       const result = await runChannel({
         channel,
         config,
@@ -96,6 +96,8 @@ program
     "Configured YouTube channel handle or channel ID",
   )
   .option("--dry-run", "Read state and print proposed changes without writing")
+  .option("--draft", "Write a plain-text draft for manual review and sending")
+  .option("--mark-sent", "Confirm that the latest pending draft was sent")
   .option(
     "--simulate-send",
     "Record a simulated successful send; never sends email",
@@ -105,16 +107,48 @@ program
     async (options: {
       channel: string;
       dryRun?: boolean;
+      draft?: boolean;
+      markSent?: boolean;
       simulateSend?: boolean;
       db?: string;
     }) => {
-      if (options.dryRun === options.simulateSend)
-        throw new Error("Choose exactly one of --dry-run or --simulate-send.");
+      const selectedModes = [
+        options.dryRun,
+        options.draft,
+        options.markSent,
+        options.simulateSend,
+      ].filter(Boolean).length;
+      if (selectedModes !== 1)
+        throw new Error(
+          "Choose exactly one of --dry-run, --draft, --mark-sent, or --simulate-send.",
+        );
       if (options.simulateSend && !options.db)
         throw new Error("--simulate-send requires an explicit --db path.");
 
       const config = await loadConfig();
       const channel = matchChannel(config.channels, options.channel);
+      if (options.markSent) {
+        const result = await confirmAlertDraftSent({
+          channel,
+          ...(options.db ? { dbPath: options.db } : {}),
+        });
+        console.log(`Marked sent: ${result.sentPath}`);
+        return;
+      }
+      if (options.draft) {
+        const result = await createAlertDraft({
+          channel,
+          config,
+          ...(options.db ? { dbPath: options.db } : {}),
+        });
+        if (result.status === "nothing")
+          console.log(
+            `Nothing to send for ${channel.handle ?? options.channel}`,
+          );
+        else console.log(`Draft written to ${result.textPath}`);
+        return;
+      }
+
       const channelHandle =
         channel.handle ?? channel.channelId ?? options.channel;
       const dbPath = options.db ?? DEFAULT_ALERT_DB_PATH;
@@ -169,6 +203,7 @@ program
   )
   .action(async (reportFolder: string) => {
     const config = await loadConfig();
+    const { sendExistingReport } = await import("./email.js");
     await sendExistingReport(reportFolder, config);
     console.log("Report email sent to configured recipients.");
   });

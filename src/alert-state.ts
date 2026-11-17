@@ -291,36 +291,67 @@ export class AlertStateStore {
   ): void {
     const timestamp = new Date(validTime(now)).toISOString();
     this.transaction(() => {
-      const insert = this.database.prepare(`
-        INSERT INTO alert_comments (
-          channel_handle, comment_id, state, first_notified_at,
-          comment_text, video_id, link
-        ) VALUES (?, ?, 'notified', ?, ?, ?, ?)
-        ON CONFLICT (channel_handle, comment_id) DO NOTHING
-      `);
-      for (const item of classification.newItems) {
-        insert.run(
-          channelHandle,
-          item.commentId,
-          timestamp,
-          item.text,
-          item.videoId,
-          item.link,
-        );
-      }
-      const remind = this.database.prepare(`
-        UPDATE alert_comments SET state = 'reminded', reminded_at = ?
-        WHERE channel_handle = ? AND comment_id = ? AND state = 'notified'
-      `);
-      for (const item of classification.reminders)
-        remind.run(timestamp, channelHandle, item.commentId);
-      this.closeCommentsInTransaction(
+      this.recordSuccessfulPassInTransaction(
         channelHandle,
+        classification.newItems,
+        classification.reminders.map((item) => item.commentId),
         classification.toClose,
         timestamp,
       );
-      this.setWatermarkInTransaction(channelHandle, timestamp);
     });
+  }
+
+  recordDraftSent(
+    channelHandle: string,
+    newItems: Omit<AlertCandidate, "channelHandle">[],
+    remindedCommentIds: string[],
+    toClose: AlertClosure[],
+    now: Date,
+  ): void {
+    const timestamp = new Date(validTime(now)).toISOString();
+    this.transaction(() =>
+      this.recordSuccessfulPassInTransaction(
+        channelHandle,
+        newItems,
+        remindedCommentIds,
+        toClose,
+        timestamp,
+      ),
+    );
+  }
+
+  private recordSuccessfulPassInTransaction(
+    channelHandle: string,
+    newItems: Omit<AlertCandidate, "channelHandle">[],
+    remindedCommentIds: string[],
+    toClose: AlertClosure[],
+    timestamp: string,
+  ): void {
+    const insert = this.database.prepare(`
+      INSERT INTO alert_comments (
+        channel_handle, comment_id, state, first_notified_at,
+        comment_text, video_id, link
+      ) VALUES (?, ?, 'notified', ?, ?, ?, ?)
+      ON CONFLICT (channel_handle, comment_id) DO NOTHING
+    `);
+    for (const item of newItems) {
+      insert.run(
+        channelHandle,
+        item.commentId,
+        timestamp,
+        item.text,
+        item.videoId,
+        item.link,
+      );
+    }
+    const remind = this.database.prepare(`
+      UPDATE alert_comments SET state = 'reminded', reminded_at = ?
+      WHERE channel_handle = ? AND comment_id = ? AND state = 'notified'
+    `);
+    for (const commentId of remindedCommentIds)
+      remind.run(timestamp, channelHandle, commentId);
+    this.closeCommentsInTransaction(channelHandle, toClose, timestamp);
+    this.setWatermarkInTransaction(channelHandle, timestamp);
   }
 
   private closeCommentsInTransaction(
