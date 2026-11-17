@@ -7,5 +7,6 @@ coverage/
 output/
 cache/
 usage_logs/
+data/
 config.json
 *.log

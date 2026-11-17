@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { runAlertsCheck } from "./alerts.js";
+import {
+  AlertStateStore,
+  DEFAULT_ALERT_DB_PATH,
+  classifyCandidates,
+  readAlertStateIfExists,
+} from "./alert-state.js";
 import { loadConfig, matchChannel } from "./config.js";
 import { sendExistingReport } from "./email.js";
 import { QuotaError, redactSecrets } from "./errors.js";
@@ -84,21 +90,75 @@ program
 
 program
   .command("alerts-check")
-  .description("Check buyer comments without sending email or writing state")
+  .description("Check buyer comments without sending email")
   .requiredOption(
     "--channel <handle>",
     "Configured YouTube channel handle or channel ID",
   )
-  .requiredOption("--dry-run", "Print qualifying buyer comments as JSON only")
-  .action(async (options: { channel: string; dryRun: boolean }) => {
-    if (!options.dryRun) throw new Error("alerts-check requires --dry-run.");
-    const config = await loadConfig();
-    const channel = matchChannel(config.channels, options.channel);
-    const result = await runAlertsCheck({ channel, config });
-    console.log(
-      JSON.stringify(result.skipped ? result : result.comments, null, 2),
-    );
-  });
+  .option("--dry-run", "Read state and print proposed changes without writing")
+  .option(
+    "--simulate-send",
+    "Record a simulated successful send; never sends email",
+  )
+  .option("--db <path>", "SQLite alert-state database path")
+  .action(
+    async (options: {
+      channel: string;
+      dryRun?: boolean;
+      simulateSend?: boolean;
+      db?: string;
+    }) => {
+      if (options.dryRun === options.simulateSend)
+        throw new Error("Choose exactly one of --dry-run or --simulate-send.");
+      if (options.simulateSend && !options.db)
+        throw new Error("--simulate-send requires an explicit --db path.");
+
+      const config = await loadConfig();
+      const channel = matchChannel(config.channels, options.channel);
+      const channelHandle =
+        channel.handle ?? channel.channelId ?? options.channel;
+      const dbPath = options.db ?? DEFAULT_ALERT_DB_PATH;
+      const store = options.simulateSend
+        ? new AlertStateStore(dbPath)
+        : readAlertStateIfExists(dbPath);
+      const now = new Date();
+      try {
+        const state = store?.getComments(channelHandle) ?? [];
+        const lastSuccessfulPass = state.some(
+          (record) => record.state === "notified",
+        )
+          ? undefined
+          : store?.getWatermark(channelHandle);
+        const result = await runAlertsCheck({
+          channel,
+          config,
+          now,
+          ...(lastSuccessfulPass ? { lastSuccessfulPass } : {}),
+          includeAllCandidates: true,
+        });
+        const candidates =
+          !result.skipped && result.candidates
+            ? result.candidates.map((candidate) => ({
+                ...candidate,
+                channelHandle,
+              }))
+            : [];
+        const classification = result.skipped
+          ? { newItems: [], reminders: [], toClose: [] }
+          : classifyCandidates(candidates, state, now);
+        if (options.simulateSend && !result.skipped) {
+          if (!store)
+            throw new Error(
+              "Alert state store is unavailable for simulated send.",
+            );
+          store.applySuccessfulPass(channelHandle, classification, now);
+        }
+        console.log(JSON.stringify(classification, null, 2));
+      } finally {
+        store?.close();
+      }
+    },
+  );
 
 program
   .command("send")

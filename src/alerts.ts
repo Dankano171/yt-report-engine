@@ -16,6 +16,11 @@ export interface BuyerAlertCandidate {
   creatorReplied: boolean;
 }
 
+export interface EvaluatedBuyerAlertCandidate extends BuyerAlertCandidate {
+  qualifies: boolean;
+  reason?: string;
+}
+
 export interface FetchAlertCandidatesOptions {
   apiKey: string;
   handleOrId: string;
@@ -31,7 +36,11 @@ export interface QualifiedBuyerAlert extends BuyerAlertCandidate {
 
 export type AlertsCheckResult =
   | { skipped: true; reason: string }
-  | { skipped: false; comments: QualifiedBuyerAlert[] };
+  | {
+      skipped: false;
+      comments: QualifiedBuyerAlert[];
+      candidates?: EvaluatedBuyerAlertCandidate[];
+    };
 
 function object(value: unknown): Record<string, unknown> {
   return value && typeof value === "object"
@@ -358,6 +367,7 @@ export async function runAlertsCheck(options: {
   llmApiKey?: string;
   fetcher?: Fetcher;
   wait?: (milliseconds: number) => Promise<void>;
+  includeAllCandidates?: boolean;
 }): Promise<AlertsCheckResult> {
   if (options.channel.enabled !== true)
     return {
@@ -387,7 +397,12 @@ export async function runAlertsCheck(options: {
     ...(options.fetcher ? { fetcher: options.fetcher } : {}),
     ...(options.wait ? { wait: options.wait } : {}),
   });
-  if (candidates.length === 0) return { skipped: false, comments: [] };
+  if (candidates.length === 0)
+    return {
+      skipped: false,
+      comments: [],
+      ...(options.includeAllCandidates ? { candidates: [] } : {}),
+    };
   const llmApiKey = options.llmApiKey ?? process.env.LLM_API_KEY;
   const qualifications = await qualifyBuyerComments(
     candidates.map(({ commentId, text, videoTitle }) => ({
@@ -414,12 +429,27 @@ export async function runAlertsCheck(options: {
       ...(options.wait ? { wait: options.wait } : {}),
     },
   );
+  const comments = filterQualifiedBuyerCandidates(
+    candidates,
+    qualifications,
+    options.now,
+  );
   return {
     skipped: false,
-    comments: filterQualifiedBuyerCandidates(
-      candidates,
-      qualifications,
-      options.now,
-    ),
+    comments,
+    ...(options.includeAllCandidates
+      ? {
+          candidates: candidates.map((candidate) => {
+            const qualified = comments.find(
+              (comment) => comment.commentId === candidate.commentId,
+            );
+            return {
+              ...candidate,
+              qualifies: qualified !== undefined,
+              ...(qualified ? { reason: qualified.reason } : {}),
+            };
+          }),
+        }
+      : {}),
   };
 }
