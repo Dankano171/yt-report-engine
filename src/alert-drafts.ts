@@ -33,6 +33,15 @@ export interface AlertDraftFiles {
   pendingPath: string;
   newCount: number;
   reminderCount: number;
+  items: AlertDraftItem[];
+}
+
+export interface AlertDraftItem {
+  text: string;
+  videoTitle: string;
+  link: string;
+  suggestedReply: string;
+  firstNotifiedAt?: string | null;
 }
 
 export interface AlertDraftOptions {
@@ -41,8 +50,20 @@ export interface AlertDraftOptions {
   now?: Date;
   dbPath?: string;
   outputRoot?: string;
+  outputDirectory?: string;
+  fileBase?: string;
   fetcher?: Fetcher;
   wait?: (milliseconds: number) => Promise<void>;
+  budget?: {
+    reserveUsd: (estimate: number) => boolean;
+    onUsage: (record: {
+      date: string;
+      youtubeQuotaUnits: number;
+      llmInputTokens: number;
+      llmOutputTokens: number;
+      estimatedUsd: number;
+    }) => Promise<void>;
+  };
   check?: (options: {
     channel: ChannelConfig;
     config: AppConfig;
@@ -51,12 +72,14 @@ export interface AlertDraftOptions {
     includeAllCandidates: true;
     fetcher?: Fetcher;
     wait?: (milliseconds: number) => Promise<void>;
+    budget?: AlertDraftOptions["budget"];
   }) => Promise<AlertsCheckResult>;
   makeReply?: (
     candidate: EvaluatedBuyerAlertCandidate,
     channel: ChannelConfig,
     config: AppConfig,
     fetcher?: Fetcher,
+    budget?: AlertDraftOptions["budget"],
   ) => Promise<string>;
 }
 
@@ -79,6 +102,7 @@ function defaultReply(
   channel: ChannelConfig,
   config: AppConfig,
   fetcher?: Fetcher,
+  budget?: AlertDraftOptions["budget"],
 ): Promise<string> {
   const apiKey = process.env.LLM_API_KEY;
   if (!apiKey)
@@ -97,6 +121,7 @@ function defaultReply(
       model,
       apiKey,
       ...(fetcher ? { fetcher } : {}),
+      ...(budget ? { budget } : {}),
     },
   );
 }
@@ -188,6 +213,7 @@ export async function createAlertDraft(
       includeAllCandidates: true,
       ...(options.fetcher ? { fetcher: options.fetcher } : {}),
       ...(options.wait ? { wait: options.wait } : {}),
+      ...(options.budget ? { budget: options.budget } : {}),
     });
     if (result.skipped || !result.candidates?.length)
       return { status: "nothing" };
@@ -216,16 +242,39 @@ export async function createAlertDraft(
           options.channel,
           options.config,
           options.fetcher,
+          options.budget,
         ),
       );
     }
 
     const date = dateStamp(now);
     const slug = channelSlug(options.channel);
-    const folder = join(options.outputRoot ?? "output", "alerts");
-    const base = join(folder, `${date}-${slug}`);
-    const textPath = `${base}.txt`;
+    const folder =
+      options.outputDirectory ?? join(options.outputRoot ?? "output", "alerts");
+    const base = options.fileBase
+      ? join(folder, options.fileBase)
+      : join(folder, `${date}-${slug}`);
+    const textPath = `${base}${options.fileBase ? ".md" : ".txt"}`;
     const pendingPath = `${base}.pending.json`;
+    const stateByComment = new Map(
+      state.map((record) => [record.commentId, record]),
+    );
+    const items: AlertDraftItem[] = [...newItems, ...reminders].map(
+      (candidate) => {
+        const firstNotifiedAt = reminders.some(
+          (reminder) => reminder.commentId === candidate.commentId,
+        )
+          ? stateByComment.get(candidate.commentId)?.firstNotifiedAt
+          : undefined;
+        return {
+          text: candidate.text,
+          videoTitle: candidate.videoTitle,
+          link: candidate.link,
+          suggestedReply: replies.get(candidate.commentId) ?? "",
+          ...(firstNotifiedAt !== undefined ? { firstNotifiedAt } : {}),
+        };
+      },
+    );
     const pending: PendingDraft = {
       version: 1,
       channelHandle,
@@ -262,6 +311,7 @@ export async function createAlertDraft(
       pendingPath,
       newCount: newItems.length,
       reminderCount: reminders.length,
+      items,
     };
   } finally {
     store?.close();
@@ -307,32 +357,35 @@ export async function confirmAlertDraftSent(options: {
   dbPath?: string;
   outputRoot?: string;
   now?: Date;
+  pendingPath?: string;
 }): Promise<{ status: "sent"; sentPath: string }> {
   const slug = channelSlug(options.channel);
   const folder = join(options.outputRoot ?? "output", "alerts");
-  let names: string[];
-  try {
-    names = await readdir(folder);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+  let pendingPath = options.pendingPath;
+  if (!pendingPath) {
+    let names: string[];
+    try {
+      names = await readdir(folder);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT")
+        throw new Error(
+          `No pending alert draft for ${options.channel.handle ?? slug}.`,
+        );
+      throw error;
+    }
+    const suffix = `-${slug}.pending.json`;
+    const pendingName = names
+      .filter(
+        (name) => /^\d{4}-\d{2}-\d{2}-/u.test(name) && name.endsWith(suffix),
+      )
+      .sort()
+      .at(-1);
+    if (!pendingName)
       throw new Error(
         `No pending alert draft for ${options.channel.handle ?? slug}.`,
       );
-    throw error;
+    pendingPath = join(folder, pendingName);
   }
-  const suffix = `-${slug}.pending.json`;
-  const pendingName = names
-    .filter(
-      (name) => /^\d{4}-\d{2}-\d{2}-/u.test(name) && name.endsWith(suffix),
-    )
-    .sort()
-    .at(-1);
-  if (!pendingName)
-    throw new Error(
-      `No pending alert draft for ${options.channel.handle ?? slug}.`,
-    );
-
-  const pendingPath = join(folder, pendingName);
   const parsed: unknown = JSON.parse(await readFile(pendingPath, "utf8"));
   if (!isPendingDraft(parsed))
     throw new Error(`Invalid pending alert draft: ${pendingPath}`);

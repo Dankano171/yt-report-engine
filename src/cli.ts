@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { runAlertsCheck } from "./alerts.js";
+import {
+  runDailyAlerts,
+  runWeeklyAlerts,
+  skipTodayAlert,
+} from "./alert-batch.js";
 import { confirmAlertDraftSent, createAlertDraft } from "./alert-drafts.js";
 import {
   AlertStateStore,
@@ -191,6 +196,93 @@ program
       } finally {
         store?.close();
       }
+    },
+  );
+
+program
+  .command("alerts-daily")
+  .description(
+    "Create buyer-alert drafts for all channels in data/channels.txt",
+  )
+  .option(
+    "--db <path>",
+    "SQLite alert-state database path",
+    DEFAULT_ALERT_DB_PATH,
+  )
+  .option("--channels <path>", "Channel list file", "data/channels.txt")
+  .option("--out <path>", "Output root directory", "output")
+  .option("--skip <path>", "Skip list path", "data/skip.txt")
+  .action(
+    async (options: {
+      db: string;
+      channels: string;
+      out: string;
+      skip: string;
+    }) => {
+      const config = await loadConfig();
+      const result = await runDailyAlerts({
+        config,
+        dbPath: options.db,
+        channelsPath: options.channels,
+        outputRoot: options.out,
+        skipPath: options.skip,
+        log: console.log,
+        warn: console.error,
+      });
+      if (result.allFailed) process.exitCode = 1;
+    },
+  );
+
+program
+  .command("alerts-weekly")
+  .description("Find one repeated viewer request for each channel")
+  .option(
+    "--db <path>",
+    "SQLite alert-state database path",
+    DEFAULT_ALERT_DB_PATH,
+  )
+  .option("--channels <path>", "Channel list file", "data/channels.txt")
+  .option("--out <path>", "Output root directory", "output")
+  .action(async (options: { db: string; channels: string; out: string }) => {
+    const config = await loadConfig();
+    const result = await runWeeklyAlerts({
+      config,
+      dbPath: options.db,
+      channelsPath: options.channels,
+      outputRoot: options.out,
+      warn: console.error,
+    });
+    console.log(`Weekly dashboard: ${options.out}/${result.date}/weekly.html`);
+    console.log(
+      `Repeated requests: ${result.findings.length} channel${result.findings.length === 1 ? "" : "s"}.`,
+    );
+  });
+
+program
+  .command("alerts-skip")
+  .description("Keep today's pending buyer-alert draft unconfirmed")
+  .argument("[handle]", "Channel handle (for example @examplecreator)")
+  .option("--channel <handle>", "Channel handle")
+  .option("--out <path>", "Output root directory", "output")
+  .action(
+    async (
+      argument: string | undefined,
+      options: { channel?: string; out: string },
+    ) => {
+      const handle = options.channel ?? argument;
+      if (!handle || (options.channel && argument))
+        throw new Error(
+          "Provide exactly one channel using --channel or <handle>.",
+        );
+      const removed = await skipTodayAlert({
+        channel: handle,
+        outputRoot: options.out,
+      });
+      console.log(
+        removed
+          ? `Removed today's pending draft for ${handle}.`
+          : `No pending draft for ${handle} today.`,
+      );
     },
   );
 

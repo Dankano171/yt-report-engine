@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { isLowInformationComment, truncateQuote } from "./classification.js";
-import { QuotaError, redactSecrets } from "./errors.js";
+import {
+  AlertBudgetExceededError,
+  QuotaError,
+  redactSecrets,
+} from "./errors.js";
 import { readUsage } from "./storage.js";
 import type {
   Category,
@@ -189,6 +193,10 @@ export interface BuyerQualificationOptions {
   apiKey?: string;
   fetcher?: Fetcher;
   wait?: (milliseconds: number) => Promise<void>;
+  budget?: {
+    reserveUsd: (estimate: number) => boolean;
+    onUsage: (record: UsageRecord) => Promise<void>;
+  };
 }
 
 const pricingPerMillion: Record<
@@ -205,6 +213,14 @@ function estimateTokens(text: string): number {
 }
 
 function estimatedUsd(
+  provider: ProviderName,
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  return estimateLlmUsd(provider, inputTokens, outputTokens);
+}
+
+export function estimateLlmUsd(
   provider: ProviderName,
   inputTokens: number,
   outputTokens: number,
@@ -1578,27 +1594,64 @@ export async function qualifyBuyerComments(
       ),
       "COMMENT DATA END",
     ].join("\n");
-    const response = await requestProvider(
-      options.provider,
-      options.model,
-      options.fallbackModel,
-      options.apiKey,
-      prompt,
-      Math.min(8192, Math.max(256, batch.length * 80 + 256)),
-      fetcher,
-      wait,
-      () => {},
-      {},
-      new Map(),
-      batch.map((comment) => comment.text),
-      Math.floor(offset / 20) + 1,
-      1,
+    const outputTokenLimit = Math.min(
+      8192,
+      Math.max(256, batch.length * 80 + 256),
     );
+    const inputEstimate = estimateTokens(prompt);
     let parsed: unknown;
-    try {
-      parsed = parseModelJson(response.text);
-    } catch {
-      throw new Error("Buyer qualification model returned invalid JSON.");
+    let responseText = "";
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      if (
+        options.budget &&
+        !options.budget.reserveUsd(
+          estimateLlmUsd(options.provider, inputEstimate, outputTokenLimit),
+        )
+      )
+        throw new AlertBudgetExceededError();
+      const response = await requestProvider(
+        options.provider,
+        options.model,
+        options.fallbackModel,
+        options.apiKey,
+        prompt,
+        outputTokenLimit,
+        fetcher,
+        wait,
+        () => {},
+        {},
+        new Map(),
+        batch.map((comment) => comment.text),
+        Math.floor(offset / 20) + 1,
+        attempt,
+      );
+      responseText = response.text;
+      const inputTokens = response.input || inputEstimate;
+      const outputTokens = response.output || estimateTokens(response.text);
+      await options.budget?.onUsage({
+        date: new Date().toISOString().slice(0, 10),
+        youtubeQuotaUnits: 0,
+        llmInputTokens: inputTokens,
+        llmOutputTokens: outputTokens,
+        estimatedUsd: estimateLlmUsd(
+          options.provider,
+          inputTokens,
+          outputTokens,
+        ),
+      });
+      try {
+        parsed = parseModelJson(responseText);
+        break;
+      } catch {
+        if (attempt === 2) {
+          const safeResponse = redactSecrets(responseText)
+            .replaceAll(options.apiKey, "[REDACTED]")
+            .slice(0, 200);
+          throw new Error(
+            `Buyer qualification model returned invalid JSON after retry: ${safeResponse}`,
+          );
+        }
+      }
     }
     const result = resultSchema.safeParse(parsed);
     if (!result.success)

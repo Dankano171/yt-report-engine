@@ -68,6 +68,22 @@ pnpm start -- alerts-check --channel @examplecreator --mark-sent
 
 Confirmation records the new/reminded comments and pass watermark, then renames the sidecar to `.sent.json`. It does not send email. A channel must set `enabled: true`, an `offerDescription`, a `runTime` in `HH:MM`, and an IANA `timezone`; `purchaseLink` is optional. Older channel configurations remain valid, and disabled channels or channels without an offer description are skipped. Suggested replies are generated for the configured writing model, use only the configured purchase link, and replace unsupported prices, dates, availability, or policy details with bracketed placeholders.
 
+For batch buyer alerts, put one channel on each line in `data/channels.txt`:
+
+```text
+@handle | Creator name | what they sell | recipient@example.com | https://example.com/buy
+```
+
+The recipient and purchase link are optional. Blank lines and `#` comments are ignored; malformed and duplicate handles are reported with their line numbers and skipped. If the file is missing, the CLI creates a commented example. Use the two daily commands to build drafts and weekly repeated-request summaries:
+
+```sh
+pnpm daily
+pnpm weekly
+pnpm skip -- @handle
+```
+
+The daily command confirms older pending drafts unless the handle is in `data/skip.txt`, then writes drafts, `summary.json`, and a self-contained `dashboard.html` under `output/<date>/`. Same-day drafts are replaced on rerun. `pnpm skip -- @handle` removes that day's pending sidecar; `pnpm start -- alerts-skip --channel @handle` is equivalent. The weekly command writes only channels with a request repeated by at least two distinct viewers and saves a dated database backup under `output/backups/`. Both batch commands accept `--db`, `--channels`, and `--out` overrides after `pnpm start -- alerts-daily` or `alerts-weekly`.
+
 ## Other commands
 
 ```sh

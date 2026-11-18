@@ -5,6 +5,7 @@ import {
   runAlertsCheck,
   type BuyerAlertCandidate,
 } from "../src/alerts.js";
+import { qualifyBuyerComments } from "../src/llm.js";
 import type { AppConfig, ChannelConfig, Fetcher } from "../src/types.js";
 
 const now = new Date("2026-03-15T12:00:00Z");
@@ -34,6 +35,7 @@ const config: AppConfig = {
 interface MockComment {
   commentId: string;
   text: string;
+  authorChannelId?: string;
   postedAt?: string;
   videoId?: string;
   videoTitle?: string;
@@ -141,7 +143,9 @@ function alertsFetcher(
                 snippet: {
                   textOriginal: comment.text,
                   publishedAt: comment.postedAt ?? "2026-03-14T12:00:00Z",
-                  authorChannelId: { value: "UCviewer" },
+                  authorChannelId: {
+                    value: comment.authorChannelId ?? "UCviewer",
+                  },
                 },
               },
             },
@@ -181,6 +185,141 @@ function candidate(
 }
 
 describe("buyer alert checks", () => {
+  it("parses fenced buyer-qualification JSON without retrying", async () => {
+    let calls = 0;
+    const fetcher: Fetcher = async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content:
+                  '```json\n[{"id":1,"verdict":true,"reason":"Asks about enrollment."}]\n```',
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    };
+
+    await expect(
+      qualifyBuyerComments(
+        [
+          {
+            commentId: "comment-1",
+            text: "How do I enroll?",
+            videoTitle: "Course details",
+          },
+        ],
+        "An online course.",
+        {
+          provider: "openai",
+          model: "test-model",
+          apiKey: "test-api-key",
+          fetcher,
+          wait: async () => {},
+        },
+      ),
+    ).resolves.toEqual([
+      {
+        commentId: "comment-1",
+        verdict: true,
+        reason: "Asks about enrollment.",
+      },
+    ]);
+    expect(calls).toBe(1);
+  });
+
+  it("retries invalid buyer-qualification JSON once and parses the fenced retry", async () => {
+    const responses = [
+      "not valid JSON",
+      '```json\n[{"id":1,"verdict":true,"reason":"Asks about enrollment."}]\n```',
+    ];
+    let calls = 0;
+    const fetcher: Fetcher = async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: responses.shift() } }],
+        }),
+        { status: 200 },
+      );
+    };
+
+    await expect(
+      qualifyBuyerComments(
+        [
+          {
+            commentId: "comment-1",
+            text: "How do I enroll?",
+            videoTitle: "Course details",
+          },
+        ],
+        "An online course.",
+        {
+          provider: "openai",
+          model: "test-model",
+          apiKey: "test-api-key",
+          fetcher,
+          wait: async () => {},
+        },
+      ),
+    ).resolves.toEqual([
+      {
+        commentId: "comment-1",
+        verdict: true,
+        reason: "Asks about enrollment.",
+      },
+    ]);
+    expect(calls).toBe(2);
+  });
+
+  it("includes only a redacted 200-character response prefix after both JSON attempts fail", async () => {
+    const apiKey = "private-test-api-key";
+    let calls = 0;
+    const responseText = `${apiKey}${"x".repeat(220)}`;
+    const fetcher: Fetcher = async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: responseText } }],
+        }),
+        { status: 200 },
+      );
+    };
+
+    let errorMessage = "";
+    try {
+      await qualifyBuyerComments(
+        [
+          {
+            commentId: "comment-1",
+            text: "How do I enroll?",
+            videoTitle: "Course details",
+          },
+        ],
+        "An online course.",
+        {
+          provider: "openai",
+          model: "test-model",
+          apiKey,
+          fetcher,
+          wait: async () => {},
+        },
+      );
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(errorMessage).toBe(
+      `Buyer qualification model returned invalid JSON after retry: [REDACTED]${"x".repeat(190)}`,
+    );
+    expect(errorMessage).not.toContain(apiKey);
+    expect(calls).toBe(2);
+  });
+
   it("qualifies buyer-intent types and excludes unrelated comment classes", async () => {
     const buyerComments = [
       "Do you sell tomato, pepper plants and a variety of veggies, strawberry plants?",
@@ -310,6 +449,28 @@ describe("buyer alert checks", () => {
     expect(result.comments.map(({ commentId }) => commentId)).toEqual([
       "viewer-replied",
     ]);
+  });
+
+  it("excludes creator-authored top-level comments from alert candidates", async () => {
+    const fetcher = alertsFetcher({
+      comments: [
+        {
+          commentId: "creator-comment",
+          text: "Please buy my course.",
+          authorChannelId: "UCcreator",
+        },
+      ],
+    });
+
+    const candidates = await fetchAlertCandidates({
+      apiKey: "test-youtube-key",
+      handleOrId: "@creator",
+      now,
+      fetcher,
+      wait: async () => {},
+    });
+
+    expect(candidates).toEqual([]);
   });
 
   it("applies the seven-day comment and 30-day video limits in code", () => {

@@ -1,12 +1,18 @@
 import { QuotaError, redactSecrets } from "./errors.js";
 import { qualifyBuyerComments, type BuyerQualification } from "./llm.js";
 import { buildDeepLink } from "./youtube.js";
-import type { AppConfig, ChannelConfig, Fetcher } from "./types.js";
+import type {
+  AppConfig,
+  ChannelConfig,
+  Fetcher,
+  UsageRecord,
+} from "./types.js";
 
 const DAY_MS = 86_400_000;
 
 export interface BuyerAlertCandidate {
   commentId: string;
+  authorChannelId?: string;
   text: string;
   videoId: string;
   videoTitle: string;
@@ -260,12 +266,20 @@ export async function fetchAlertCandidates(
         const commentSnippet = object(topLevelComment.snippet);
         const commentId = string(topLevelComment.id);
         const postedAt = string(commentSnippet.publishedAt);
+        const authorChannelId = string(
+          object(commentSnippet.authorChannelId).value,
+        );
         const postedTime = getTimestamp(postedAt);
         if (postedTime !== undefined && postedTime < commentCutoff) {
           stopCommentPaging = true;
           break;
         }
-        if (!commentId || postedTime === undefined || postedTime > nowTime)
+        if (
+          !commentId ||
+          postedTime === undefined ||
+          postedTime > nowTime ||
+          authorChannelId === channelId
+        )
           continue;
 
         const totalReplyCount = Number(threadSnippet.totalReplyCount ?? 0);
@@ -301,6 +315,7 @@ export async function fetchAlertCandidates(
 
         candidates.push({
           commentId,
+          ...(authorChannelId ? { authorChannelId } : {}),
           text:
             string(commentSnippet.textOriginal) ||
             string(commentSnippet.textDisplay),
@@ -368,6 +383,10 @@ export async function runAlertsCheck(options: {
   fetcher?: Fetcher;
   wait?: (milliseconds: number) => Promise<void>;
   includeAllCandidates?: boolean;
+  budget?: {
+    reserveUsd: (estimate: number) => boolean;
+    onUsage: (record: UsageRecord) => Promise<void>;
+  };
 }): Promise<AlertsCheckResult> {
   if (options.channel.enabled !== true)
     return {
@@ -427,6 +446,7 @@ export async function runAlertsCheck(options: {
       ...(llmApiKey ? { apiKey: llmApiKey } : {}),
       ...(options.fetcher ? { fetcher: options.fetcher } : {}),
       ...(options.wait ? { wait: options.wait } : {}),
+      ...(options.budget ? { budget: options.budget } : {}),
     },
   );
   const comments = filterQualifiedBuyerCandidates(

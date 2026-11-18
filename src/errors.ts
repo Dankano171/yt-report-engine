@@ -5,6 +5,13 @@ export class QuotaError extends Error {
   }
 }
 
+export class AlertBudgetExceededError extends Error {
+  constructor() {
+    super("The configured LLM spend limit was reached.");
+    this.name = "AlertBudgetExceededError";
+  }
+}
+
 export function redactSecrets(message: string): string {
   let sanitized = message;
   for (const name of ["YOUTUBE_API_KEY", "LLM_API_KEY", "RESEND_API_KEY"]) {

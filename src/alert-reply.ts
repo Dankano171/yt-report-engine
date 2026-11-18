@@ -1,10 +1,17 @@
 import type { ChannelConfig, Fetcher, ProviderName } from "./types.js";
+import { AlertBudgetExceededError } from "./errors.js";
+import { estimateLlmUsd } from "./llm.js";
+import type { UsageRecord } from "./types.js";
 
 export interface SuggestedReplyOptions {
   provider: ProviderName;
   model: string;
   apiKey: string;
   fetcher?: Fetcher;
+  budget?: {
+    reserveUsd: (estimate: number) => boolean;
+    onUsage: (record: UsageRecord) => Promise<void>;
+  };
 }
 
 export interface SuggestedReplyInput {
@@ -60,6 +67,10 @@ function replyPrompt(input: SuggestedReplyInput): string {
     `Video title: ${input.videoTitle}`,
     `Viewer comment: ${input.commentText}`,
   ].join("\n");
+}
+
+function estimatedTokens(text: string): number {
+  return Math.ceil(text.length / 4);
 }
 
 const definitiveClaimPatterns = [
@@ -133,6 +144,15 @@ export async function generateSuggestedReply(
 
   const fetcher = options.fetcher ?? fetch;
   const prompt = replyPrompt(input);
+  const outputTokenLimit = 160;
+  const inputTokenEstimate = estimatedTokens(prompt);
+  if (
+    options.budget &&
+    !options.budget.reserveUsd(
+      estimateLlmUsd(options.provider, inputTokenEstimate, outputTokenLimit),
+    )
+  )
+    throw new AlertBudgetExceededError();
   let url: string;
   let headers: Record<string, string>;
   let body: Record<string, unknown>;
@@ -146,7 +166,7 @@ export async function generateSuggestedReply(
     body = {
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
-        maxOutputTokens: 160,
+        maxOutputTokens: outputTokenLimit,
         responseMimeType: "text/plain",
       },
     };
@@ -159,7 +179,7 @@ export async function generateSuggestedReply(
     };
     body = {
       model: options.model,
-      max_tokens: 160,
+      max_tokens: outputTokenLimit,
       messages: [{ role: "user", content: prompt }],
     };
   } else {
@@ -170,7 +190,7 @@ export async function generateSuggestedReply(
     };
     body = {
       model: options.model,
-      max_tokens: 160,
+      max_tokens: outputTokenLimit,
       messages: [{ role: "user", content: prompt }],
     };
   }
@@ -182,10 +202,17 @@ export async function generateSuggestedReply(
   });
   if (!response.ok)
     throw new Error(`Suggested reply generation failed (${response.status}).`);
-  const text = extractProviderText(
-    options.provider,
-    (await response.json()) as unknown,
-  );
+  const responseBody = (await response.json()) as unknown;
+  const text = extractProviderText(options.provider, responseBody);
   if (!text) throw new Error("Suggested reply model returned no text.");
+  const inputTokens = estimatedTokens(prompt);
+  const outputTokens = estimatedTokens(text);
+  await options.budget?.onUsage({
+    date: new Date().toISOString().slice(0, 10),
+    youtubeQuotaUnits: 0,
+    llmInputTokens: inputTokens,
+    llmOutputTokens: outputTokens,
+    estimatedUsd: estimateLlmUsd(options.provider, inputTokens, outputTokens),
+  });
   return sanitizeReply(text, input);
 }

@@ -9,6 +9,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file-if-exists=.env dist/cli.js",
+    "daily": "node --env-file-if-exists=.env dist/cli.js alerts-daily",
+    "weekly": "node --env-file-if-exists=.env dist/cli.js alerts-weekly",
+    "skip": "node --env-file-if-exists=.env dist/cli.js alerts-skip",
     "pretest": "pnpm check:secrets",
     "test": "vitest run",
     "lint": "eslint . && prettier --check .",
