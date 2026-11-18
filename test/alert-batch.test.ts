@@ -298,6 +298,55 @@ describe("daily alert batches", () => {
     expect(first.channels[0]?.status).toBe("drafted");
   });
 
+  it("groups dashboard comments by video with one reply per matching question group", async () => {
+    const paths = await setup("@garden | Garden | Gardening course");
+    await runDailyAlerts({
+      config,
+      ...paths,
+      now,
+      createDraft: (draftOptions) =>
+        createAlertDraft({
+          ...draftOptions,
+          check: async () => ({
+            skipped: false,
+            comments: [],
+            candidates: [
+              candidate("@garden", {
+                commentId: "first",
+                text: "What is price?",
+              }),
+              candidate("@garden", {
+                commentId: "second",
+                text: "What is the price",
+                link: "https://youtube.test/second",
+              }),
+              candidate("@garden", {
+                commentId: "third",
+                videoId: "video-2",
+                videoTitle: "Growing peppers",
+                text: "How do I enroll?",
+              }),
+            ],
+          }),
+          makeReply: async (selected) => `Reply for ${selected.commentId}`,
+        }),
+    });
+
+    const html = await readFile(
+      join(paths.outputRoot, "2026-03-15", "dashboard.html"),
+      "utf8",
+    );
+    expect(html.indexOf("Growing tomatoes (2 buyer comments)")).toBeLessThan(
+      html.indexOf("Growing peppers (1 buyer comment)"),
+    );
+    expect(html).toContain("What is price?");
+    expect(html).toContain("What is the price");
+    expect(html).toContain("https://youtube.test/second");
+    expect(html).toContain("2 related buyer comments");
+    expect(html).toContain("Reply for first");
+    expect(html).not.toContain("Reply for second");
+  });
+
   it("marks a budget-limited channel and reports all-channel failure", async () => {
     const paths = await setup(
       "@budget | Budget | A course\n@error | Error | A course",

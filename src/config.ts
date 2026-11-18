@@ -162,9 +162,10 @@ export async function loadConfig(path = "config.json"): Promise<AppConfig> {
 export function matchChannel(
   channels: ChannelConfig[],
   handle: string,
+  additionalChannels: ChannelConfig[] = [],
 ): ChannelConfig {
   const normalized = handle.replace(/^@/, "").toLowerCase();
-  const channel = channels.find((item) => {
+  const channel = [...channels, ...additionalChannels].find((item) => {
     if (
       item.handle &&
       item.handle.replace(/^@/, "").toLowerCase() === normalized
@@ -173,6 +174,8 @@ export function matchChannel(
     return item.channelId?.toLowerCase() === handle.toLowerCase();
   });
   if (!channel)
-    throw new Error(`Channel ${handle} is not configured in config.json.`);
+    throw new Error(
+      `Channel ${handle} is not configured in config.json or data/channels.txt.`,
+    );
   return channel;
 }

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { isBuyerAlertChannelEnabled } from "../src/alerts.js";
+import { readChannelFile } from "../src/alert-channels.js";
+import { matchChannel } from "../src/config.js";
 import type { ChannelConfig } from "../src/types.js";
 
 let root: string | undefined;
@@ -36,6 +38,39 @@ async function loadChannel(channel: Record<string, unknown>) {
 }
 
 describe("buyer alert channel configuration", () => {
+  it("matches channels.txt channels for alert checks while preferring config.json", async () => {
+    root = await mkdtemp(join(tmpdir(), "yt-report-alert-config-"));
+    const channelPath = join(root, "channels.txt");
+    await writeFile(
+      channelPath,
+      [
+        "@creator | File Creator | File offer",
+        "@file-only | File Only | A gardening course",
+      ].join("\n"),
+    );
+    const fileChannels = await readChannelFile(channelPath, () => {});
+    const configuredChannel: ChannelConfig = {
+      handle: "@creator",
+      creatorName: "Configured Creator",
+      creatorGoal: "sell_course",
+      recipients: ["config@example.com"],
+      productKeywords: [],
+      enabled: true,
+      offerDescription: "Configured offer",
+    };
+
+    expect(
+      matchChannel([configuredChannel], "@file-only", fileChannels),
+    ).toMatchObject({
+      handle: "@file-only",
+      creatorName: "File Only",
+      offerDescription: "A gardening course",
+    });
+    expect(matchChannel([configuredChannel], "@CREATOR", fileChannels)).toBe(
+      configuredChannel,
+    );
+  });
+
   it("loads a valid enabled channel with the alert settings", async () => {
     const config = await loadChannel({
       enabled: true,

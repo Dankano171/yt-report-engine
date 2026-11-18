@@ -105,18 +105,38 @@ function escaped(value: string): string {
 function dashboardHtml(date: string, channels: DailyChannelResult[]): string {
   const content = channels
     .map((channel) => {
+      const videoCounts = new Map<string, number>();
+      for (const item of channel.items) {
+        videoCounts.set(
+          item.videoId,
+          (videoCounts.get(item.videoId) ?? 0) + item.comments.length,
+        );
+      }
+      let currentVideoId: string | undefined;
       const comments = channel.items
-        .map(
-          (item) => `<article class="comment">
-  <p class="viewer-comment">${escaped(item.text)}</p>
-  <p><strong>Video:</strong> ${escaped(item.videoTitle)}</p>
-  <p><strong>Link:</strong> <a href="${escaped(item.link)}">${escaped(item.link)}</a></p>
-  ${item.firstNotifiedAt !== undefined ? `<p class="first-sent">First sent ${escaped(item.firstNotifiedAt?.slice(0, 10) ?? "unknown date")} — reminder</p>` : ""}
+        .map((item) => {
+          const videoHeading =
+            item.videoId === currentVideoId
+              ? ""
+              : `<h3>${escaped(item.videoTitle)} (${videoCounts.get(item.videoId)} buyer comment${videoCounts.get(item.videoId) === 1 ? "" : "s"})</h3>`;
+          currentVideoId = item.videoId;
+          const viewers = item.comments
+            .map(
+              (comment, index) => `<div class="viewer">
+  <p class="viewer-comment"><strong>Viewer ${index + 1} exact words:</strong> ${escaped(comment.text)}</p>
+  <p><strong>Link:</strong> <a href="${escaped(comment.link)}">${escaped(comment.link)}</a></p>
+  ${comment.firstNotifiedAt !== undefined ? `<p class="first-sent">First sent ${escaped(comment.firstNotifiedAt?.slice(0, 10) ?? "unknown date")} — reminder</p>` : ""}
+</div>`,
+            )
+            .join("\n");
+          return `${videoHeading}<article class="comment">
+  <p><strong>${item.comments.length} related buyer comment${item.comments.length === 1 ? "" : "s"}</strong></p>
+  ${viewers}
   <p><strong>Suggested reply:</strong> <span class="reply">${escaped(item.suggestedReply)}</span>
     <button type="button" class="copy" data-reply="${escaped(item.suggestedReply)}">Copy</button>
   </p>
-</article>`,
-        )
+</article>`;
+        })
         .join("\n");
       return `<section>
   <h2>${escaped(channel.name)} <span class="handle">${escaped(channel.handle)}</span></h2>

@@ -6,6 +6,7 @@ import {
   runWeeklyAlerts,
   skipTodayAlert,
 } from "./alert-batch.js";
+import { readChannelFile } from "./alert-channels.js";
 import { confirmAlertDraftSent, createAlertDraft } from "./alert-drafts.js";
 import {
   AlertStateStore,
@@ -131,7 +132,11 @@ program
         throw new Error("--simulate-send requires an explicit --db path.");
 
       const config = await loadConfig();
-      const channel = matchChannel(config.channels, options.channel);
+      const channel = matchChannel(
+        config.channels,
+        options.channel,
+        await readChannelFile(),
+      );
       if (options.markSent) {
         const result = await confirmAlertDraftSent({
           channel,

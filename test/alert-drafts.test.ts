@@ -130,9 +130,9 @@ describe("manual alert drafts", () => {
     if (result.status !== "drafted") throw new Error("Expected a draft.");
     const text = await readFile(result.textPath, "utf8");
     expect(text).toContain("Subject: 1 buyer comment waiting - Creator");
-    expect(text).toContain("NEW");
+    expect(text).toContain("VIDEO:");
     expect(text).toContain("How much does the course cost?");
-    expect(text).toContain("Video: Growing tomatoes");
+    expect(text).toContain("VIDEO: Growing tomatoes");
     expect(text).toContain(candidate().link);
     expect(text).toContain(
       "Suggested reply: You can find more information in the course details.",
@@ -146,6 +146,68 @@ describe("manual alert drafts", () => {
       newCommentIds: ["comment-1"],
       remindedCommentIds: [],
     });
+  });
+
+  it("groups matching questions by video, preserves exact words and links, and sorts videos by comment count", async () => {
+    const paths = await setup();
+    const reply = vi.fn(
+      async (selected: EvaluatedBuyerAlertCandidate) =>
+        `Reply for ${selected.commentId}`,
+    );
+    const result = await createAlertDraft({
+      channel,
+      config,
+      now,
+      ...paths,
+      check: checkWith([
+        candidate({ commentId: "heavy-1", text: "What is price?" }),
+        candidate({
+          commentId: "heavy-2",
+          text: "What is the price",
+          link: "https://youtube.test/heavy-2",
+        }),
+        candidate({
+          commentId: "heavy-3",
+          text: "How do I enroll?",
+        }),
+        candidate({
+          commentId: "light-1",
+          videoId: "video-2",
+          videoTitle: "Growing peppers",
+          text: "What's the price?",
+        }),
+      ]),
+      makeReply: reply,
+    });
+
+    expect(result.status).toBe("drafted");
+    if (result.status !== "drafted") throw new Error("Expected a draft.");
+    expect(reply).toHaveBeenCalledTimes(3);
+    expect(
+      result.items.map(({ videoId, comments }) => [videoId, comments.length]),
+    ).toEqual([
+      ["video-1", 2],
+      ["video-1", 1],
+      ["video-2", 1],
+    ]);
+    expect(result.items[0]).toMatchObject({
+      comments: [
+        { text: "What is price?", link: candidate().link },
+        { text: "What is the price", link: "https://youtube.test/heavy-2" },
+      ],
+      suggestedReply: "Reply for heavy-1",
+    });
+    const text = await readFile(result.textPath, "utf8");
+    expect(text.indexOf("VIDEO: Growing tomatoes")).toBeLessThan(
+      text.indexOf("VIDEO: Growing peppers"),
+    );
+    expect(text).toContain("VIDEO: Growing tomatoes (3 buyer comments)");
+    expect(text).toContain("Question group (2 viewers):");
+    expect(text).toContain("Viewer 1 exact words: What is price?");
+    expect(text).toContain("Viewer 2 exact words: What is the price");
+    expect(text).toContain("Link: https://youtube.test/heavy-2");
+    expect(text).toContain("Suggested reply: Reply for heavy-1");
+    expect(text).not.toContain("Suggested reply: Reply for heavy-2");
   });
 
   it("retries reply 429 and 503 responses using Retry-After and backoff", async () => {
@@ -215,7 +277,7 @@ describe("manual alert drafts", () => {
     if (result.status !== "drafted") throw new Error("Expected a draft.");
     expect(result.items).toMatchObject([
       {
-        text: candidate().text,
+        comments: [{ text: candidate().text }],
         suggestedReply: "Thanks for asking! [Add your reply]",
       },
     ]);
@@ -229,7 +291,7 @@ describe("manual alert drafts", () => {
     ]);
   });
 
-  it("writes new and 72-hour reminder sections into one draft", async () => {
+  it("keeps new and 72-hour reminder comments together with each reminder date", async () => {
     const paths = await setup();
     const store = new AlertStateStore(paths.dbPath);
     const remindedAt = new Date(now.getTime() - 72 * 60 * 60 * 1_000);
@@ -264,8 +326,7 @@ describe("manual alert drafts", () => {
     expect(result.status).toBe("drafted");
     if (result.status !== "drafted") throw new Error("Expected a draft.");
     const text = await readFile(result.textPath, "utf8");
-    expect(text).toContain("\nNEW\n");
-    expect(text).toContain("\nSTILL UNANSWERED\n");
+    expect(text).toContain("VIDEO: Growing tomatoes (2 buyer comments)");
     expect(text).toContain("First sent 2026-03-12, still no reply from you.");
     expect(result.newCount).toBe(1);
     expect(result.reminderCount).toBe(1);

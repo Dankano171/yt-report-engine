@@ -38,11 +38,21 @@ export interface AlertDraftFiles {
 }
 
 export interface AlertDraftItem {
-  text: string;
+  videoId: string;
   videoTitle: string;
-  link: string;
+  comments: {
+    text: string;
+    link: string;
+    firstNotifiedAt?: string | null;
+  }[];
   suggestedReply: string;
-  firstNotifiedAt?: string | null;
+}
+
+interface AlertDraftGroup {
+  videoId: string;
+  videoTitle: string;
+  candidates: EvaluatedBuyerAlertCandidate[];
+  firstNotifiedAtByCommentId: Map<string, string | null>;
 }
 
 export interface AlertDraftOptions {
@@ -131,65 +141,107 @@ function defaultReply(
   );
 }
 
-function renderComment(
-  candidate: EvaluatedBuyerAlertCandidate,
-  reply: string,
-  reminder?: { firstNotifiedAt: string | null },
-): string {
-  return [
-    candidate.text,
-    `Video: ${candidate.videoTitle}`,
-    `Link: ${candidate.link}`,
-    ...(reminder
-      ? [
-          `First sent ${reminder.firstNotifiedAt?.slice(0, 10) ?? "unknown date"}, still no reply from you.`,
-        ]
-      : []),
-    `Suggested reply: ${reply}`,
-  ].join("\n");
+function normalizeQuestion(text: string): string {
+  return text
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\bwhat['’]s\b/gu, "what is")
+    .replace(/\b(?:a|an|the)\b/gu, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
-function renderDraft(
-  channel: ChannelConfig,
-  newItems: EvaluatedBuyerAlertCandidate[],
+function groupDraftCandidates(
+  candidates: EvaluatedBuyerAlertCandidate[],
   reminders: EvaluatedBuyerAlertCandidate[],
   state: ReturnType<
     NonNullable<ReturnType<typeof readAlertStateIfExists>>["getComments"]
   >,
-  replies: Map<string, string>,
+): AlertDraftGroup[] {
+  const reminderIds = new Set(reminders.map(({ commentId }) => commentId));
+  const stateByComment = new Map(
+    state.map((record) => [record.commentId, record]),
+  );
+  const videos = new Map<
+    string,
+    { groups: AlertDraftGroup[]; questions: Map<string, AlertDraftGroup> }
+  >();
+
+  for (const candidate of candidates) {
+    let video = videos.get(candidate.videoId);
+    if (!video) {
+      video = { groups: [], questions: new Map() };
+      videos.set(candidate.videoId, video);
+    }
+    const normalized = normalizeQuestion(candidate.text);
+    const questionKey = normalized || candidate.commentId;
+    let group = video.questions.get(questionKey);
+    if (!group) {
+      group = {
+        videoId: candidate.videoId,
+        videoTitle: candidate.videoTitle,
+        candidates: [],
+        firstNotifiedAtByCommentId: new Map(),
+      };
+      video.questions.set(questionKey, group);
+      video.groups.push(group);
+    }
+    group.candidates.push(candidate);
+    if (reminderIds.has(candidate.commentId)) {
+      group.firstNotifiedAtByCommentId.set(
+        candidate.commentId,
+        stateByComment.get(candidate.commentId)?.firstNotifiedAt ?? null,
+      );
+    }
+  }
+
+  return [...videos.values()]
+    .sort(
+      (left, right) =>
+        right.groups.reduce((sum, group) => sum + group.candidates.length, 0) -
+        left.groups.reduce((sum, group) => sum + group.candidates.length, 0),
+    )
+    .flatMap(({ groups }) => groups);
+}
+
+function renderDraft(
+  channel: ChannelConfig,
+  items: AlertDraftItem[],
+  newCount: number,
+  reminderCount: number,
 ): string {
-  const total = newItems.length + reminders.length;
+  const total = items.reduce((sum, item) => sum + item.comments.length, 0);
   const subjectStatus =
-    reminders.length > 0 && newItems.length === 0
-      ? "still unanswered"
-      : "waiting";
+    reminderCount > 0 && newCount === 0 ? "still unanswered" : "waiting";
   const lines = [
     `Subject: ${total} buyer comment${total === 1 ? "" : "s"} ${subjectStatus} - ${channel.creatorName}`,
     "",
   ];
-
-  if (newItems.length > 0) {
-    lines.push("NEW", "");
-    for (const candidate of newItems) {
+  let currentVideoId: string | undefined;
+  for (const item of items) {
+    if (item.videoId !== currentVideoId) {
+      currentVideoId = item.videoId;
+      const videoCount = items
+        .filter((entry) => entry.videoId === item.videoId)
+        .reduce((sum, entry) => sum + entry.comments.length, 0);
       lines.push(
-        renderComment(candidate, replies.get(candidate.commentId) ?? ""),
+        `VIDEO: ${item.videoTitle} (${videoCount} buyer comment${videoCount === 1 ? "" : "s"})`,
         "",
       );
     }
-  }
-  if (reminders.length > 0) {
-    const records = new Map(state.map((record) => [record.commentId, record]));
-    lines.push("STILL UNANSWERED", "");
-    for (const candidate of reminders) {
-      lines.push(
-        renderComment(
-          candidate,
-          replies.get(candidate.commentId) ?? "",
-          records.get(candidate.commentId),
-        ),
-        "",
-      );
+    lines.push(
+      `Question group (${item.comments.length} viewer${item.comments.length === 1 ? "" : "s"}):`,
+    );
+    for (const [index, comment] of item.comments.entries()) {
+      lines.push(`Viewer ${index + 1} exact words: ${comment.text}`);
+      lines.push(`Link: ${comment.link}`);
+      if (comment.firstNotifiedAt !== undefined)
+        lines.push(
+          `First sent ${comment.firstNotifiedAt?.slice(0, 10) ?? "unknown date"}, still no reply from you.`,
+        );
     }
+    lines.push(`Suggested reply: ${item.suggestedReply}`, "");
   }
   return `${lines.join("\n").trimEnd()}\n`;
 }
@@ -237,28 +289,48 @@ export async function createAlertDraft(
     const newItems = classification.newItems as EvaluatedBuyerAlertCandidate[];
     const reminders =
       classification.reminders as EvaluatedBuyerAlertCandidate[];
+    const groups = groupDraftCandidates(
+      [...newItems, ...reminders],
+      reminders,
+      state,
+    );
     const replyMaker = options.makeReply ?? defaultReply;
-    const replies = new Map<string, string>();
-    for (const candidate of [...newItems, ...reminders]) {
+    const items: AlertDraftItem[] = [];
+    for (const group of groups) {
+      const representative = group.candidates[0]!;
+      let suggestedReply: string;
       try {
-        replies.set(
-          candidate.commentId,
-          await replyMaker(
-            candidate,
-            options.channel,
-            options.config,
-            options.fetcher,
-            options.budget,
-            options.wait,
-          ),
+        suggestedReply = await replyMaker(
+          representative,
+          options.channel,
+          options.config,
+          options.fetcher,
+          options.budget,
+          options.wait,
         );
       } catch (error) {
         if (error instanceof AlertBudgetExceededError) throw error;
         options.warn?.(
-          `Suggested reply failed for ${candidate.commentId}; using fallback: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+          `Suggested reply failed for ${representative.commentId}; using fallback: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
         );
-        replies.set(candidate.commentId, "Thanks for asking! [Add your reply]");
+        suggestedReply = "Thanks for asking! [Add your reply]";
       }
+      items.push({
+        videoId: group.videoId,
+        videoTitle: group.videoTitle,
+        comments: group.candidates.map((candidate) => ({
+          text: candidate.text,
+          link: candidate.link,
+          ...(group.firstNotifiedAtByCommentId.has(candidate.commentId)
+            ? {
+                firstNotifiedAt:
+                  group.firstNotifiedAtByCommentId.get(candidate.commentId) ??
+                  null,
+              }
+            : {}),
+        })),
+        suggestedReply,
+      });
     }
 
     const date = dateStamp(now);
@@ -270,25 +342,6 @@ export async function createAlertDraft(
       : join(folder, `${date}-${slug}`);
     const textPath = `${base}${options.fileBase ? ".md" : ".txt"}`;
     const pendingPath = `${base}.pending.json`;
-    const stateByComment = new Map(
-      state.map((record) => [record.commentId, record]),
-    );
-    const items: AlertDraftItem[] = [...newItems, ...reminders].map(
-      (candidate) => {
-        const firstNotifiedAt = reminders.some(
-          (reminder) => reminder.commentId === candidate.commentId,
-        )
-          ? stateByComment.get(candidate.commentId)?.firstNotifiedAt
-          : undefined;
-        return {
-          text: candidate.text,
-          videoTitle: candidate.videoTitle,
-          link: candidate.link,
-          suggestedReply: replies.get(candidate.commentId) ?? "",
-          ...(firstNotifiedAt !== undefined ? { firstNotifiedAt } : {}),
-        };
-      },
-    );
     const pending: PendingDraft = {
       version: 1,
       channelHandle,
@@ -312,7 +365,7 @@ export async function createAlertDraft(
     await mkdir(folder, { recursive: true });
     await writeFile(
       textPath,
-      renderDraft(options.channel, newItems, reminders, state, replies),
+      renderDraft(options.channel, items, newItems.length, reminders.length),
       { encoding: "utf8", mode: 0o600 },
     );
     await writeFile(pendingPath, `${JSON.stringify(pending, null, 2)}\n`, {
