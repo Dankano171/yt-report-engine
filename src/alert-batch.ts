@@ -238,7 +238,12 @@ export async function runDailyAlerts(
     ...(options.usagePath ? { usagePath: options.usagePath } : {}),
   });
   const channelsResult: DailyChannelResult[] = [];
-  for (const channel of channels) {
+  const wait =
+    options.wait ??
+    ((milliseconds: number) =>
+      new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  for (const [index, channel] of channels.entries()) {
+    if (index > 0) await wait(250);
     const handle = channel.handle ?? channel.channelId ?? "";
     const fileBase = safeFileHandle(channel);
     try {
@@ -253,6 +258,7 @@ export async function runDailyAlerts(
         budget,
         ...(options.fetcher ? { fetcher: options.fetcher } : {}),
         ...(options.wait ? { wait: options.wait } : {}),
+        ...(options.warn ? { warn: options.warn } : {}),
       });
       if (draft.status === "nothing") {
         await removeIfExists(join(outputDirectory, `${fileBase}.md`));

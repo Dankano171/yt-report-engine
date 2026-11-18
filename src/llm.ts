@@ -5,6 +5,7 @@ import {
   QuotaError,
   redactSecrets,
 } from "./errors.js";
+import { BUYER_ALERT_RETRY_DELAYS_MS, getRetryDelay } from "./llm-retry.js";
 import { readUsage } from "./storage.js";
 import type {
   Category,
@@ -450,6 +451,7 @@ async function requestProvider(
   batchNumber: number,
   analysisAttempt: number,
   onProviderExchange?: LlmOptions["onProviderExchange"],
+  retryPolicy?: { delaysMs: readonly number[] },
 ): Promise<
   ReturnType<typeof extractText> & { model: string; droppedFields: string[] }
 > {
@@ -525,7 +527,8 @@ async function requestProvider(
       };
     }
 
-    for (let attempt = 0; attempt <= 4; attempt += 1) {
+    const maxRetries = retryPolicy?.delaysMs.length ?? 4;
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       let response: Response;
       try {
         response = await fetcher(url, {
@@ -602,9 +605,13 @@ async function requestProvider(
         }
       }
       if (response.status === 429 || response.status === 503) {
-        if (attempt < 4) {
+        if (attempt < maxRetries) {
           onRetry(selectedModel, attempt + 1, response.status);
-          await wait(250 * 2 ** attempt);
+          await wait(
+            retryPolicy
+              ? getRetryDelay(response, attempt, retryPolicy.delaysMs)
+              : 250 * 2 ** attempt,
+          );
           continue;
         }
         if (modelIndex + 1 < configuredModels.length) break;
@@ -1624,6 +1631,8 @@ export async function qualifyBuyerComments(
         batch.map((comment) => comment.text),
         Math.floor(offset / 20) + 1,
         attempt,
+        undefined,
+        { delaysMs: BUYER_ALERT_RETRY_DELAYS_MS },
       );
       responseText = response.text;
       const inputTokens = response.input || inputEstimate;

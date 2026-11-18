@@ -276,6 +276,62 @@ describe("buyer alert checks", () => {
     expect(calls).toBe(2);
   });
 
+  it("retries qualification 429 and 503 responses using Retry-After and backoff", async () => {
+    const waits: number[] = [];
+    const responses = [
+      new Response("{}", { status: 429, headers: { "Retry-After": "7" } }),
+      new Response("{}", { status: 503 }),
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content:
+                  '[{"id":1,"verdict":true,"reason":"Asks about enrollment."}]',
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    ];
+    let calls = 0;
+    const fetcher: Fetcher = async () => {
+      calls += 1;
+      return responses.shift()!;
+    };
+
+    await expect(
+      qualifyBuyerComments(
+        [
+          {
+            commentId: "comment-1",
+            text: "How do I enroll?",
+            videoTitle: "Course details",
+          },
+        ],
+        "An online course.",
+        {
+          provider: "openai",
+          model: "test-model",
+          apiKey: "test-api-key",
+          fetcher,
+          wait: async (milliseconds) => {
+            waits.push(milliseconds);
+          },
+        },
+      ),
+    ).resolves.toEqual([
+      {
+        commentId: "comment-1",
+        verdict: true,
+        reason: "Asks about enrollment.",
+      },
+    ]);
+    expect(calls).toBe(3);
+    expect(waits).toEqual([7_000, 5_000]);
+  });
+
   it("includes only a redacted 200-character response prefix after both JSON attempts fail", async () => {
     const apiKey = "private-test-api-key";
     let calls = 0;

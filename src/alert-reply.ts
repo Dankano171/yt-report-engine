@@ -1,6 +1,7 @@
 import type { ChannelConfig, Fetcher, ProviderName } from "./types.js";
 import { AlertBudgetExceededError } from "./errors.js";
 import { estimateLlmUsd } from "./llm.js";
+import { BUYER_ALERT_RETRY_DELAYS_MS, getRetryDelay } from "./llm-retry.js";
 import type { UsageRecord } from "./types.js";
 
 export interface SuggestedReplyOptions {
@@ -8,6 +9,7 @@ export interface SuggestedReplyOptions {
   model: string;
   apiKey: string;
   fetcher?: Fetcher;
+  wait?: (milliseconds: number) => Promise<void>;
   budget?: {
     reserveUsd: (estimate: number) => boolean;
     onUsage: (record: UsageRecord) => Promise<void>;
@@ -195,13 +197,33 @@ export async function generateSuggestedReply(
     };
   }
 
-  const response = await fetcher(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-  if (!response.ok)
-    throw new Error(`Suggested reply generation failed (${response.status}).`);
+  const wait =
+    options.wait ??
+    ((milliseconds: number) =>
+      new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  let response: Response | undefined;
+  for (
+    let attempt = 0;
+    attempt <= BUYER_ALERT_RETRY_DELAYS_MS.length;
+    attempt += 1
+  ) {
+    response = await fetcher(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (
+      response.ok ||
+      (response.status !== 429 && response.status !== 503) ||
+      attempt === BUYER_ALERT_RETRY_DELAYS_MS.length
+    )
+      break;
+    await wait(getRetryDelay(response, attempt, BUYER_ALERT_RETRY_DELAYS_MS));
+  }
+  if (!response?.ok)
+    throw new Error(
+      `Suggested reply generation failed (${response?.status ?? "unknown"}).`,
+    );
   const responseBody = (await response.json()) as unknown;
   const text = extractProviderText(options.provider, responseBody);
   if (!text) throw new Error("Suggested reply model returned no text.");

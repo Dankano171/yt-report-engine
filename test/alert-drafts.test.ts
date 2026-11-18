@@ -42,6 +42,7 @@ afterEach(async () => {
   if (root) await rm(root, { recursive: true, force: true });
   root = undefined;
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 async function setup() {
@@ -145,6 +146,87 @@ describe("manual alert drafts", () => {
       newCommentIds: ["comment-1"],
       remindedCommentIds: [],
     });
+  });
+
+  it("retries reply 429 and 503 responses using Retry-After and backoff", async () => {
+    const waits: number[] = [];
+    const responses = [
+      new Response("{}", { status: 429, headers: { "Retry-After": "3" } }),
+      new Response("{}", { status: 503 }),
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "Thanks for your question." } }],
+        }),
+        { status: 200 },
+      ),
+    ];
+    let calls = 0;
+    const fetcher: Fetcher = async () => {
+      calls += 1;
+      return responses.shift()!;
+    };
+
+    await expect(
+      generateSuggestedReply(
+        {
+          commentText: "Where can I learn more?",
+          videoTitle: "Video",
+          channel: { offerDescription: "A gardening course." },
+        },
+        {
+          provider: "openai",
+          model: "test-model",
+          apiKey: "test-key",
+          fetcher,
+          wait: async (milliseconds) => {
+            waits.push(milliseconds);
+          },
+        },
+      ),
+    ).resolves.toBe("Thanks for your question.");
+    expect(calls).toBe(3);
+    expect(waits).toEqual([3_000, 5_000]);
+  });
+
+  it("keeps qualified comments in the draft when reply generation exhausts retries", async () => {
+    vi.stubEnv("LLM_API_KEY", "test-key");
+    const paths = await setup();
+    const waits: number[] = [];
+    const warnings: string[] = [];
+    let calls = 0;
+    const fetcher: Fetcher = async () => {
+      calls += 1;
+      return new Response("{}", { status: 503 });
+    };
+    const result = await createAlertDraft({
+      channel,
+      config,
+      now,
+      ...paths,
+      fetcher,
+      wait: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+      warn: (message) => warnings.push(message),
+      check: checkWith([candidate()]),
+    });
+
+    expect(result.status).toBe("drafted");
+    if (result.status !== "drafted") throw new Error("Expected a draft.");
+    expect(result.items).toMatchObject([
+      {
+        text: candidate().text,
+        suggestedReply: "Thanks for asking! [Add your reply]",
+      },
+    ]);
+    expect(await readFile(result.textPath, "utf8")).toContain(
+      "Suggested reply: Thanks for asking! [Add your reply]",
+    );
+    expect(calls).toBe(4);
+    expect(waits).toEqual([2_000, 5_000, 15_000]);
+    expect(warnings).toEqual([
+      "Suggested reply failed for comment-1; using fallback: Suggested reply generation failed (503).",
+    ]);
   });
 
   it("writes new and 72-hour reminder sections into one draft", async () => {

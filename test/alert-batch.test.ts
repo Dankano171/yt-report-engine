@@ -158,6 +158,25 @@ describe("channel list parsing", () => {
 });
 
 describe("daily alert batches", () => {
+  it("waits briefly between channels", async () => {
+    const paths = await setup(
+      "@first | First | Gardening course\n@second | Second | Gardening course\n@third | Third | Gardening course",
+    );
+    const waits: number[] = [];
+
+    await runDailyAlerts({
+      config,
+      ...paths,
+      now,
+      wait: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+      createDraft: async () => ({ status: "nothing" }),
+    });
+
+    expect(waits).toEqual([250, 250]);
+  });
+
   it("auto-confirms only older, unskipped drafts and isolates one failing channel", async () => {
     const paths = await setup(
       [

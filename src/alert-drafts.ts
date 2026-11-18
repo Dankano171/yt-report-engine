@@ -13,6 +13,7 @@ import {
   type AlertCandidate,
   type AlertClosure,
 } from "./alert-state.js";
+import { AlertBudgetExceededError, redactSecrets } from "./errors.js";
 import { generateSuggestedReply } from "./alert-reply.js";
 import type { AppConfig, ChannelConfig, Fetcher } from "./types.js";
 
@@ -54,6 +55,7 @@ export interface AlertDraftOptions {
   fileBase?: string;
   fetcher?: Fetcher;
   wait?: (milliseconds: number) => Promise<void>;
+  warn?: (message: string) => void;
   budget?: {
     reserveUsd: (estimate: number) => boolean;
     onUsage: (record: {
@@ -80,6 +82,7 @@ export interface AlertDraftOptions {
     config: AppConfig,
     fetcher?: Fetcher,
     budget?: AlertDraftOptions["budget"],
+    wait?: (milliseconds: number) => Promise<void>,
   ) => Promise<string>;
 }
 
@@ -103,6 +106,7 @@ function defaultReply(
   config: AppConfig,
   fetcher?: Fetcher,
   budget?: AlertDraftOptions["budget"],
+  wait?: (milliseconds: number) => Promise<void>,
 ): Promise<string> {
   const apiKey = process.env.LLM_API_KEY;
   if (!apiKey)
@@ -121,6 +125,7 @@ function defaultReply(
       model,
       apiKey,
       ...(fetcher ? { fetcher } : {}),
+      ...(wait ? { wait } : {}),
       ...(budget ? { budget } : {}),
     },
   );
@@ -235,16 +240,25 @@ export async function createAlertDraft(
     const replyMaker = options.makeReply ?? defaultReply;
     const replies = new Map<string, string>();
     for (const candidate of [...newItems, ...reminders]) {
-      replies.set(
-        candidate.commentId,
-        await replyMaker(
-          candidate,
-          options.channel,
-          options.config,
-          options.fetcher,
-          options.budget,
-        ),
-      );
+      try {
+        replies.set(
+          candidate.commentId,
+          await replyMaker(
+            candidate,
+            options.channel,
+            options.config,
+            options.fetcher,
+            options.budget,
+            options.wait,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof AlertBudgetExceededError) throw error;
+        options.warn?.(
+          `Suggested reply failed for ${candidate.commentId}; using fallback: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+        );
+        replies.set(candidate.commentId, "Thanks for asking! [Add your reply]");
+      }
     }
 
     const date = dateStamp(now);
